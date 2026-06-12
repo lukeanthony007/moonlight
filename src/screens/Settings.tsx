@@ -435,12 +435,25 @@ function PlatformsSection() {
 function ProvidersSection() {
   const settings = useSettingsStore();
   const providers = useSettingsStore((s) => s.providers);
+  const activeScanId = useScanStore((s) => s.activeScanId);
   const [key, setKey] = useState("");
+  const [enrichError, setEnrichError] = useState<string | null>(null);
+
+  const anyConfigured = providers.some((p) => p.configured);
 
   useEffect(() => {
     setKey(settings.get("providers.steamgriddb.apiKey", ""));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [settings.loaded]);
+
+  async function fetchMissingArtwork() {
+    setEnrichError(null);
+    try {
+      await api.enrichArtwork();
+    } catch (e) {
+      setEnrichError(api.errorMessage(e));
+    }
+  }
 
   return (
     <div>
@@ -448,6 +461,38 @@ function ProvidersSection() {
         title="Metadata Providers"
         description="Optional services for metadata and artwork. Moonlight works fully without them — all metadata can be edited manually."
       />
+
+      <div className="mb-4 rounded-xl glass p-5">
+        <div className="flex items-center justify-between gap-4">
+          <div className="min-w-0">
+            <div className="text-sm font-medium">Fetch artwork for games missing it</div>
+            <p className="mt-1 text-xs text-ink-dim">
+              Steam games import their artwork automatically. ROM and manually-added games (GameCube,
+              Switch, PlayStation…) have no local artwork — fetch box art, backgrounds and logos for all
+              of them from a configured provider below.
+            </p>
+          </div>
+          <Button
+            className="shrink-0"
+            disabled={!anyConfigured || activeScanId !== null}
+            onClick={fetchMissingArtwork}
+          >
+            <Image /> Fetch artwork
+          </Button>
+        </div>
+        {!anyConfigured && (
+          <p className="mt-3 text-xs text-ink-faint">
+            Configure a provider API key below to enable this. Without one, you can still add artwork
+            per game from the artwork picker (local file or URL).
+          </p>
+        )}
+        {enrichError && (
+          <div className="mt-3 rounded-lg border border-danger/30 bg-danger/10 px-3 py-2 text-xs text-danger">
+            {enrichError}
+          </div>
+        )}
+      </div>
+
       {providers.map((provider) => (
         <div key={provider.id} className="rounded-xl glass p-5">
           <div className="flex items-center justify-between">

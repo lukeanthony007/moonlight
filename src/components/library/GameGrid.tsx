@@ -19,6 +19,7 @@ const CARD_MIN_WIDTH = 168;
 const CARD_GAP = 18;
 const CARD_EXTRA_HEIGHT = 62; // title block under the 3/4 artwork
 const LIST_ROW_HEIGHT = 64;
+const GRID_PADDING = 16; // breathing room above/below so focus rings aren't clipped
 
 /** Virtualized, keyboard/controller-navigable game grid. */
 export function GameGrid({
@@ -60,6 +61,10 @@ export function GameGrid({
     getScrollElement: () => parentRef.current,
     estimateSize: () => rowHeight,
     overscan: 4,
+    // Leading/trailing space so a focused card's ring + hover-lift on the
+    // first/last row is never clipped by the scroll container edge.
+    paddingStart: GRID_PADDING,
+    paddingEnd: GRID_PADDING,
   });
 
   // Re-measure when layout inputs change.
@@ -69,11 +74,24 @@ export function GameGrid({
 
   const clampedFocus = Math.min(focusIndex, Math.max(0, games.length - 1));
 
+  // Keep the focused row inside a comfortable band so its focus ring stays
+  // fully visible even mid-list (align:auto would pin it flush to the edge
+  // and clip the ring).
   const scrollToIndex = useCallback(
     (index: number) => {
-      virtualizer.scrollToIndex(Math.floor(index / columns), { align: "auto" });
+      const el = parentRef.current;
+      if (!el) return;
+      const row = Math.floor(index / columns);
+      const top = GRID_PADDING + row * rowHeight;
+      const bottom = top + rowHeight;
+      const margin = 12;
+      if (top - margin < el.scrollTop) {
+        el.scrollTo({ top: Math.max(0, top - margin) });
+      } else if (bottom + margin > el.scrollTop + el.clientHeight) {
+        el.scrollTo({ top: bottom + margin - el.clientHeight });
+      }
     },
-    [virtualizer, columns],
+    [columns, rowHeight],
   );
 
   // Keyboard navigation (also driven by the controller via synthetic events).

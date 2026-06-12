@@ -3,6 +3,7 @@ pub mod catalog;
 pub mod commands;
 pub mod db;
 pub mod domain;
+pub mod enrich;
 pub mod error;
 pub mod launch;
 pub mod metadata;
@@ -132,6 +133,7 @@ pub fn run() {
             commands::launching::launch_game,
             commands::launching::get_running_games,
             commands::scanning::start_scan,
+            commands::scanning::enrich_artwork,
             commands::scanning::cancel_scan,
             commands::scanning::get_last_scan_report,
             commands::meta::get_provider_statuses,

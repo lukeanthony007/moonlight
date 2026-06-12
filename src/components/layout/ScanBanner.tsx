@@ -15,6 +15,8 @@ export function ScanBanner() {
   const showProgress = activeScanId !== null;
   const showReport = !showProgress && lastReport !== null && !reportDismissed;
 
+  const isArtwork = progress?.source === "artwork" || lastReport?.source === "artwork";
+
   return (
     <div className="pointer-events-none fixed bottom-5 left-1/2 z-50 -translate-x-1/2">
       <AnimatePresence>
@@ -31,7 +33,7 @@ export function ScanBanner() {
             <Loader2 className="size-5 shrink-0 animate-spin text-accent" />
             <div className="min-w-0 w-72">
               <div className="text-sm font-medium">
-                Scanning library
+                {isArtwork ? "Fetching artwork" : "Scanning library"}
                 {progress?.total ? ` · ${progress.current}/${progress.total}` : "…"}
               </div>
               <div className="truncate text-xs text-ink-dim">{progress?.message ?? "Starting…"}</div>
@@ -66,9 +68,17 @@ export function ScanBanner() {
             )}
             <div className="min-w-0 max-w-md">
               <div className="text-sm font-medium">
-                {lastReport.cancelled ? "Scan cancelled" : "Scan complete"}
+                {lastReport.cancelled
+                  ? isArtwork
+                    ? "Artwork fetch cancelled"
+                    : "Scan cancelled"
+                  : isArtwork
+                    ? "Artwork fetch complete"
+                    : "Scan complete"}
                 <span className="ml-2 text-xs font-normal text-ink-dim">
-                  {lastReport.added} added · {lastReport.reconnected} reconnected · {lastReport.missing} missing
+                  {isArtwork
+                    ? `${lastReport.updated} matched · ${lastReport.skipped} without artwork`
+                    : `${lastReport.added} added · ${lastReport.reconnected} reconnected · ${lastReport.missing} missing`}
                 </span>
               </div>
               {lastReport.errors.length > 0 && (

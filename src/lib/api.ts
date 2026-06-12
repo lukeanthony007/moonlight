@@ -105,6 +105,8 @@ export const getRunningGames = () => invoke<RunningGame[]>("get_running_games");
 
 // Scanning
 export const startScan = (scope: ScanScopeInput) => invoke<string>("start_scan", { scope });
+export const enrichArtwork = (platformId?: string) =>
+  invoke<string>("enrich_artwork", { platformId: platformId ?? null });
 export const cancelScan = (scanId: string) => invoke<boolean>("cancel_scan", { scanId });
 export const getLastScanReport = () => invoke<ScanReport | null>("get_last_scan_report");
 

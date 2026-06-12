@@ -41,6 +41,13 @@ pub fn extract_title_id(name: &str) -> Option<u64> {
     None
 }
 
+/// Extract a title ID from anywhere in a path — the filename first, then each
+/// ancestor directory (deepest first). Switch dumps often put the ID only on
+/// the containing folder (`Mario Kart 8 [0100…]/sxs-mk8u.nsp`).
+pub fn extract_title_id_from_path(path: &str) -> Option<u64> {
+    path.rsplit(['/', '\\']).find_map(extract_title_id)
+}
+
 /// The base application ID that owns a title (base game, update or DLC).
 ///
 /// Switch base IDs are multiples of 0x2000 (low 13 bits zero); updates set the
@@ -203,6 +210,22 @@ mod tests {
         assert_eq!(title_kind_priority(0x01006A800016E000), 0); // base
         assert_eq!(title_kind_priority(0x01006A800016E800), 1); // update
         assert_eq!(title_kind_priority(0x01006A800016F002), 2); // DLC
+    }
+
+    #[test]
+    fn extracts_title_id_from_parent_directory() {
+        // Scene update file with the ID only on the grandparent folder.
+        let path = "/roms/Mario Kart 8 Deluxe [0100152000022000]/Update [0100152000022800 ]/sxs-mk8u_v1179648.nsp";
+        assert_eq!(extract_title_id_from_path(path), Some(0x0100152000022800));
+        assert_eq!(
+            base_app_id(extract_title_id_from_path(path).unwrap()),
+            0x0100152000022000
+        );
+        // No ID anywhere.
+        assert_eq!(
+            extract_title_id_from_path("/roms/Super Mario Odyssey.nsp"),
+            None
+        );
     }
 
     /// Live tinfoil.media check — downloads the eShop icon for a real title ID.

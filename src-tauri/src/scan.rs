@@ -352,10 +352,15 @@ fn sync_switch_directory(
             .push(format!("directory not found: {}", dir.path));
         return Ok(());
     }
+
+    // Remove previously-imported homebrew (`.nro`) tools like JKSV / switch-time.
+    db.with(|c| delete_homebrew_games(c, report))?;
+
     let all_files = collect_rom_files(dir, platform, cancel)?;
 
-    // Group files by base application ID; files without a title ID stay
-    // standalone; `.nro` homebrew is skipped entirely.
+    // Group files by base application ID — the title ID may live on the file
+    // OR on an ancestor folder. Files without any title ID stay standalone;
+    // `.nro` homebrew is skipped entirely.
     let mut groups: HashMap<u64, Vec<RomFile>> = HashMap::new();
     let mut standalone: Vec<RomFile> = Vec::new();
     for file in all_files {
@@ -363,7 +368,7 @@ fn sync_switch_directory(
             report.skipped += 1;
             continue;
         }
-        match crate::switch_art::extract_title_id(&file.file_name) {
+        match crate::switch_art::extract_title_id_from_path(&file.path) {
             Some(tid) => groups
                 .entry(crate::switch_art::base_app_id(tid))
                 .or_default()
@@ -385,7 +390,7 @@ fn sync_switch_directory(
         }
         // Pick the bootable file: base > update > DLC, then largest.
         files.sort_by_key(|f| {
-            let tid = crate::switch_art::extract_title_id(&f.file_name).unwrap_or(0);
+            let tid = crate::switch_art::extract_title_id_from_path(&f.path).unwrap_or(0);
             (
                 crate::switch_art::title_kind_priority(tid),
                 std::cmp::Reverse(f.size),
@@ -394,8 +399,10 @@ fn sync_switch_directory(
         let primary = files[0].clone();
         let base_hex = format!("{base:016X}");
         let group_paths: Vec<String> = files.iter().map(|f| f.path.clone()).collect();
+        // Prefer the game-folder name over scene-release / update filenames.
+        let title = best_switch_title(&files);
         index += 1;
-        progress.report("importing", index, total, &primary.file_name);
+        progress.report("importing", index, total, &title);
 
         db.with(|c| {
             reconcile_switch_group(
@@ -403,6 +410,7 @@ fn sync_switch_directory(
                 &base_hex,
                 &primary,
                 &group_paths,
+                &title,
                 emulator_id.as_deref(),
                 report,
             )
@@ -428,6 +436,7 @@ fn reconcile_switch_group(
     base_hex: &str,
     primary: &RomFile,
     group_paths: &[String],
+    title: &str,
     emulator_id: Option<&str>,
     report: &mut ScanReport,
 ) -> Result<()> {
@@ -449,14 +458,13 @@ fn reconcile_switch_group(
     }
 
     if game_ids.is_empty() {
-        let (title, region) = title_from_filename(&primary.file_name);
         let game = games::insert(
             conn,
             &games::NewGame {
-                title: &title,
+                title,
                 platform_id: "switch",
                 release_date: None,
-                region: region.as_deref(),
+                region: None,
             },
         )?;
         conn.execute(
@@ -477,6 +485,9 @@ fn reconcile_switch_group(
         merged = true;
     }
 
+    // Replace any auto-generated title with the cleaner derived one.
+    let title_changed = set_title_if_unlocked(conn, &keep, title)?;
+
     // Normalize the kept game to a single canonical installation. Skip the
     // rewrite when it already matches, so unchanged rescans stay quiet.
     let already_canonical: bool = conn
@@ -488,7 +499,7 @@ fn reconcile_switch_group(
         )
         .unwrap_or(false);
 
-    if already_canonical && !merged {
+    if already_canonical && !merged && !title_changed {
         report.skipped += 1;
         return Ok(());
     }
@@ -500,6 +511,104 @@ fn reconcile_switch_group(
     )?;
     report.updated += 1;
     Ok(())
+}
+
+/// Update a game's title (and sort title) unless the user locked the field.
+/// Returns whether a change was written.
+fn set_title_if_unlocked(conn: &Connection, game_id: &str, title: &str) -> Result<bool> {
+    if title.trim().is_empty() {
+        return Ok(false);
+    }
+    let (current, locked): (String, String) = conn.query_row(
+        "SELECT title, locked_fields FROM games WHERE id = ?1",
+        [game_id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    if current == title || locked.contains("\"title\"") {
+        return Ok(false);
+    }
+    conn.execute(
+        "UPDATE games SET title = ?1, sort_title = ?2 WHERE id = ?3",
+        params![title, games::sort_title_for(title), game_id],
+    )?;
+    Ok(true)
+}
+
+/// Delete any homebrew (`.nro`) games previously imported on the Switch
+/// platform (they are skipped on future scans).
+fn delete_homebrew_games(conn: &Connection, report: &mut ScanReport) -> Result<()> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT g.id FROM games g JOIN installations i ON i.game_id = g.id
+         WHERE g.platform_id = 'switch' AND i.source_type = 'rom' AND lower(i.path) LIKE '%.nro'",
+    )?;
+    let ids: Vec<String> = stmt
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+    for id in ids {
+        games::delete(conn, &id)?;
+        report.skipped += 1;
+    }
+    Ok(())
+}
+
+/// Score a candidate title: more alphabetic content is better; scene-release
+/// and bare-version names (`v-…`, `sxs-…`, `v131072`) are heavily penalized.
+fn title_score(title: &str) -> i32 {
+    let t = title.trim();
+    if t.is_empty() {
+        return i32::MIN;
+    }
+    let alpha = t.chars().filter(|c| c.is_alphabetic()).count() as i32;
+    let lower = t.to_lowercase();
+    let penalized = lower.starts_with("v-")
+        || lower.starts_with("v ")
+        || lower.starts_with("sxs")
+        || t.chars().next().is_some_and(|c| c.is_ascii_digit());
+    alpha - if penalized { 1000 } else { 0 }
+}
+
+/// Best human title for a Switch game group. Considers each file's cleaned
+/// name and any title-ID-bearing ancestor folder (e.g.
+/// `Prince Of Persia - The Lost Crown [0100…]`), falling back to the immediate
+/// parent folder when only scene-release filenames are available.
+fn best_switch_title(files: &[RomFile]) -> String {
+    let mut best: Option<(i32, String)> = None;
+    let mut consider = |raw: &str| {
+        let (title, _) = title_from_filename(raw);
+        let score = title_score(&title);
+        if score > 0 && best.as_ref().map(|(s, _)| score > *s).unwrap_or(true) {
+            best = Some((score, title));
+        }
+    };
+    for file in files {
+        consider(&file.file_name);
+        // Ancestor directories that carry a title ID are the game's folder.
+        let mut comps: Vec<&str> = file.path.split(['/', '\\']).collect();
+        comps.pop(); // drop the filename
+        for comp in comps {
+            if crate::switch_art::extract_title_id(comp).is_some() {
+                consider(comp);
+            }
+        }
+    }
+    if let Some((_, title)) = best {
+        return title;
+    }
+    // Fallback: the immediate parent folder, then the cleaned filename.
+    for file in files {
+        if let Some(parent) = Path::new(&file.path)
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+        {
+            let (title, _) = title_from_filename(parent);
+            if !title.trim().is_empty() {
+                return title;
+            }
+        }
+    }
+    title_from_filename(&files[0].file_name).0
 }
 
 fn game_id_for_source(conn: &Connection, source_id: &str) -> Result<Option<String>> {
@@ -536,6 +645,17 @@ fn upsert_standalone_rom(
     }
     let (title, region) = title_from_filename(&file.file_name);
     if title.is_empty() {
+        report.skipped += 1;
+        return Ok(());
+    }
+    // Avoid creating a duplicate of a game already imported under the same
+    // title on this platform (e.g. a loose copy alongside a foldered dump).
+    let duplicate: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM games WHERE platform_id = ?1 AND sort_title = ?2)",
+        params![dir.platform_id, games::sort_title_for(&title)],
+        |r| r.get(0),
+    )?;
+    if duplicate {
         report.skipped += 1;
         return Ok(());
     }
@@ -926,6 +1046,103 @@ mod tests {
             .with(|c| Ok(c.query_row("SELECT COUNT(*) FROM games", [], |r| r.get(0))?))
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn switch_groups_by_folder_id_and_uses_folder_title() {
+        // Scene-named update/DLC files whose ID lives only on the game folder,
+        // plus a clean base file at the root — all one game, titled well.
+        let tmp = tempfile::tempdir().unwrap();
+        let pop = tmp
+            .path()
+            .join("Prince Of Persia - The Lost Crown [0100210019428000]");
+        let dlc = pop.join("DLC [0100210019429002]");
+        std::fs::create_dir_all(&dlc).unwrap();
+        std::fs::write(pop.join("v-prince_of_persia_the_lost_crown.nsp"), b"base").unwrap();
+        std::fs::write(
+            pop.join("v-prince_of_persia_the_lost_crown_v131072.nsp"),
+            b"update",
+        )
+        .unwrap();
+        std::fs::write(
+            dlc.join("v-prince_of_persia_immortal_outfit_dlc.nsp"),
+            b"dlc",
+        )
+        .unwrap();
+
+        let db = Db::open_in_memory().unwrap();
+        let dir = switch_dir(&db, tmp.path().to_str().unwrap());
+        let cancel = AtomicBool::new(false);
+        let mut report = ScanReport::default();
+        sync_rom_directory(&db, &dir, &cancel, &sink(), &mut report).unwrap();
+
+        let titles: Vec<String> = db
+            .with(|c| {
+                let mut stmt = c.prepare("SELECT title FROM games")?;
+                let r = stmt
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(r)
+            })
+            .unwrap();
+        assert_eq!(
+            titles,
+            vec!["Prince Of Persia - The Lost Crown"],
+            "got {titles:?}"
+        );
+    }
+
+    #[test]
+    fn switch_skips_and_removes_nro_homebrew() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("JKSV.nro"), b"hb").unwrap();
+        std::fs::write(
+            tmp.path().join("Kirby [01004D300C5AE000][v0].nsp"),
+            b"kirby",
+        )
+        .unwrap();
+
+        let db = Db::open_in_memory().unwrap();
+        let dir = switch_dir(&db, tmp.path().to_str().unwrap());
+
+        // Pre-seed a homebrew game as a prior scan would have.
+        db.with(|c| {
+            let g = games::insert(
+                c,
+                &games::NewGame {
+                    title: "switch-time",
+                    platform_id: "switch",
+                    release_date: None,
+                    region: None,
+                },
+            )?;
+            c.execute(
+                "INSERT INTO installations (id, game_id, source_type, source_id, path, installed)
+                 VALUES (?1, ?2, 'rom', ?3, ?3, 1)",
+                params![repo::new_id(), g.id, "/x/switch-time.nro"],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        let cancel = AtomicBool::new(false);
+        let mut report = ScanReport::default();
+        sync_rom_directory(&db, &dir, &cancel, &sink(), &mut report).unwrap();
+
+        let titles: Vec<String> = db
+            .with(|c| {
+                let mut stmt = c.prepare("SELECT title FROM games")?;
+                let r = stmt
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(r)
+            })
+            .unwrap();
+        assert_eq!(
+            titles,
+            vec!["Kirby"],
+            "homebrew should be gone, got {titles:?}"
+        );
     }
 
     #[test]

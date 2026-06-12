@@ -353,7 +353,8 @@ fn sync_switch_directory(
         return Ok(());
     }
 
-    // Remove previously-imported homebrew (`.nro`) tools like JKSV / switch-time.
+    // Remove leftovers the current scanner would skip: homebrew (`.nro`) and
+    // loose scene-release / empty-titled files from earlier scans.
     db.with(|c| delete_homebrew_games(c, report))?;
 
     let all_files = collect_rom_files(dir, platform, cancel)?;
@@ -534,20 +535,43 @@ fn set_title_if_unlocked(conn: &Connection, game_id: &str, title: &str) -> Resul
     Ok(true)
 }
 
-/// Delete any homebrew (`.nro`) games previously imported on the Switch
-/// platform (they are skipped on future scans).
+/// Delete Switch games the current scanner would no longer import: homebrew
+/// (`.nro`) tools, and loose scene-release / empty-titled standalone files that
+/// carry no title ID (e.g. `v-prince_of_persia_the_lost_crown.nsp` at the root)
+/// — these are leftovers from earlier scans.
 fn delete_homebrew_games(conn: &Connection, report: &mut ScanReport) -> Result<()> {
     let mut stmt = conn.prepare(
-        "SELECT DISTINCT g.id FROM games g JOIN installations i ON i.game_id = g.id
-         WHERE g.platform_id = 'switch' AND i.source_type = 'rom' AND lower(i.path) LIKE '%.nro'",
+        "SELECT g.id, i.path FROM games g JOIN installations i ON i.game_id = g.id
+         WHERE g.platform_id = 'switch' AND i.source_type = 'rom'",
     )?;
-    let ids: Vec<String> = stmt
-        .query_map([], |r| r.get::<_, String>(0))?
+    let rows: Vec<(String, Option<String>)> = stmt
+        .query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+        })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(stmt);
-    for id in ids {
-        games::delete(conn, &id)?;
-        report.skipped += 1;
+
+    for (id, path) in rows {
+        let Some(path) = path else { continue };
+        let lower = path.to_lowercase();
+        let unwanted = if lower.ends_with(".nro") {
+            true
+        } else if crate::switch_art::extract_title_id_from_path(&path).is_none() {
+            // No title ID anywhere — a loose file. Drop it only if its name is
+            // scene-release junk or empty (real loose games keep clean names).
+            let file_name = Path::new(&path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+            let (title, _) = title_from_filename(file_name);
+            title.is_empty() || is_scene_release(&title)
+        } else {
+            false
+        };
+        if unwanted {
+            games::delete(conn, &id)?;
+            report.skipped += 1;
+        }
     }
     Ok(())
 }
@@ -1112,14 +1136,33 @@ mod tests {
             .join("Prince Of Persia - The Lost Crown [0100210019428000]");
         std::fs::create_dir_all(&folder).unwrap();
         std::fs::write(folder.join("prince [0100210019428000][v0].nsp"), b"base").unwrap();
-        std::fs::write(
-            tmp.path().join("v-prince_of_persia_the_lost_crown.nsp"),
-            b"loose",
-        )
-        .unwrap();
+        let loose = tmp.path().join("v-prince_of_persia_the_lost_crown.nsp");
+        std::fs::write(&loose, b"loose").unwrap();
 
         let db = Db::open_in_memory().unwrap();
         let dir = switch_dir(&db, tmp.path().to_str().unwrap());
+
+        // Pre-seed the loose scene file as an earlier scan would have, to prove
+        // the purge removes existing junk (not just skips new junk).
+        db.with(|c| {
+            let g = games::insert(
+                c,
+                &games::NewGame {
+                    title: "v-prince of persia the lost crown",
+                    platform_id: "switch",
+                    release_date: None,
+                    region: None,
+                },
+            )?;
+            c.execute(
+                "INSERT INTO installations (id, game_id, source_type, source_id, path, installed)
+                 VALUES (?1, ?2, 'rom', ?3, ?3, 1)",
+                params![repo::new_id(), g.id, loose.to_str().unwrap()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
         let cancel = AtomicBool::new(false);
         let mut report = ScanReport::default();
         sync_rom_directory(&db, &dir, &cancel, &sink(), &mut report).unwrap();

@@ -154,6 +154,13 @@ pub fn prepare_launch(
         None => None,
     };
 
+    // Default the working directory to the game's own folder: native Linux
+    // games and Wine-run Windows games commonly load assets relative to cwd.
+    let game_dir = game_path
+        .and_then(|p| Path::new(p).parent())
+        .and_then(|p| p.to_str())
+        .map(|s| s.to_string());
+
     match emulator {
         None => {
             let path = game_path
@@ -166,7 +173,7 @@ pub fn prepare_launch(
             Ok(LaunchSpec {
                 program: path.to_string(),
                 args,
-                working_directory: install.working_directory.clone(),
+                working_directory: install.working_directory.clone().or(game_dir),
                 environment: HashMap::new(),
             })
         }
@@ -200,7 +207,8 @@ pub fn prepare_launch(
             let cwd = install
                 .working_directory
                 .as_deref()
-                .or(emulator.working_directory.as_deref());
+                .or(emulator.working_directory.as_deref())
+                .or(game_dir.as_deref());
             build_spec(&emulator.command_template, &ctx, cwd, &emulator.environment)
         }
     }
@@ -370,6 +378,8 @@ pub use catalog::core_platform_hints;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::Db;
+    use rusqlite::params;
 
     fn ctx<'a>() -> LaunchContext<'a> {
         LaunchContext {
@@ -378,6 +388,48 @@ mod tests {
             core_path: Some("/cores/mupen64plus_next_libretro.so"),
             extra_args: None,
         }
+    }
+
+    /// Native (no-emulator) launches default cwd to the game's own folder, so
+    /// Linux games and scripts that load assets relative to cwd just work.
+    #[test]
+    fn native_launch_defaults_cwd_to_game_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let game_dir = tmp.path().join("My Game");
+        std::fs::create_dir_all(&game_dir).unwrap();
+        let game = game_dir.join("start.sh");
+        std::fs::write(&game, b"#!/bin/sh\n").unwrap();
+
+        let db = Db::open_in_memory().unwrap();
+        db.with(|c| {
+            c.execute(
+                "INSERT INTO platforms (id, name, short_name) VALUES ('linux','Linux','Linux')",
+                [],
+            )?;
+            let g = crate::db::repo::games::insert(
+                c,
+                &crate::db::repo::games::NewGame {
+                    title: "My Game",
+                    platform_id: "linux",
+                    release_date: None,
+                    region: None,
+                },
+            )?;
+            c.execute(
+                "INSERT INTO installations (id, game_id, source_type, path, installed)
+                 VALUES ('i1', ?1, 'manual', ?2, 1)",
+                params![g.id, game.to_str().unwrap()],
+            )?;
+            let install = crate::db::repo::games::installations_for(c, &g.id)?
+                .into_iter()
+                .next()
+                .unwrap();
+            let spec = prepare_launch(c, &install, "linux")?;
+            assert_eq!(spec.program, game.to_str().unwrap());
+            assert_eq!(spec.working_directory.as_deref(), game_dir.to_str());
+            Ok(())
+        })
+        .unwrap();
     }
 
     #[test]

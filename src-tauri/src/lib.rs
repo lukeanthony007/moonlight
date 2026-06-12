@@ -58,6 +58,9 @@ pub fn run() {
                 for platform in catalog::builtin_platforms() {
                     platforms::ensure(c, &platform)?;
                 }
+                if platforms::normalize_legacy_windows_extensions(c)? {
+                    tracing::info!("moved .sh from Windows defaults to the Linux platform");
+                }
                 let dangling = sessions::close_dangling(c)?;
                 if dangling > 0 {
                     tracing::warn!(

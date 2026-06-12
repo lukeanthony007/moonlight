@@ -31,8 +31,19 @@ pub fn builtin_platforms() -> Vec<Platform> {
             "Windows",
             "PC",
             Some("Microsoft"),
-            &["exe", "bat", "lnk", "sh"],
+            &["exe", "bat", "lnk"],
             1,
+        ),
+        // Native Linux games (Lutris's "linux" runner): shell launchers,
+        // AppImages and itch.io-style binaries. They launch directly with no
+        // emulator; Windows games on Linux go through a Wine/Proton runner.
+        platform(
+            "linux",
+            "Linux",
+            "Linux",
+            None,
+            &["sh", "appimage", "run", "x86_64"],
+            2,
         ),
         platform(
             "nes",
@@ -319,6 +330,30 @@ pub fn emulator_presets() -> Vec<EmulatorPreset> {
             ],
             &["cue", "bin", "chd", "pbp", "iso", "m3u"],
         ),
+        // Windows-game runners (Lutris-style): the "platform" stays Windows,
+        // the runner decides how the exe is launched on this OS.
+        preset(
+            "wine",
+            "Wine",
+            "standalone",
+            &["windows"],
+            "{executable} {gamePath}",
+            &[
+                "/usr/bin/wine",
+                "/usr/local/bin/wine",
+                "/var/lib/flatpak/exports/bin/org.winehq.Wine",
+            ],
+            &["exe", "bat", "msi"],
+        ),
+        preset(
+            "umu",
+            "Proton (umu)",
+            "standalone",
+            &["windows"],
+            "{executable} {gamePath}",
+            &["/usr/bin/umu-run", "/usr/local/bin/umu-run"],
+            &["exe", "bat", "msi"],
+        ),
         preset(
             "custom",
             "Custom emulator",
@@ -359,4 +394,35 @@ pub fn core_platform_hints() -> Vec<(&'static str, &'static str)> {
         ("mame", "arcade"),
         ("fbneo", "arcade"),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Lutris-style mapping: a native Linux platform exists, and Windows
+    /// games get Wine/Proton runner presets instead of a separate platform.
+    #[test]
+    fn linux_platform_and_windows_runners_exist() {
+        let platforms = builtin_platforms();
+        let linux = platforms
+            .iter()
+            .find(|p| p.id == "linux")
+            .expect("linux platform");
+        assert!(linux.extensions.contains(&"sh".to_string()));
+        assert!(linux.extensions.contains(&"appimage".to_string()));
+
+        let windows = platforms.iter().find(|p| p.id == "windows").unwrap();
+        assert!(
+            !windows.extensions.contains(&"sh".to_string()),
+            ".sh belongs to linux now"
+        );
+
+        let presets = emulator_presets();
+        for runner in ["wine", "umu"] {
+            let p = presets.iter().find(|p| p.id == runner).expect(runner);
+            assert_eq!(p.platforms, vec!["windows"], "{runner} runs Windows games");
+            assert!(p.command_template.contains("{executable}"));
+        }
+    }
 }

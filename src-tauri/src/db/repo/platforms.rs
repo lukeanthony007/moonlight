@@ -75,3 +75,39 @@ pub fn set_default_emulator(
     )?;
     Ok(())
 }
+
+/// One-time fix-up for databases seeded before the Linux platform existed:
+/// `.sh` belonged to the Windows defaults and now lives on Linux. Only rewrites
+/// the exact legacy default, so user-customized extension lists are untouched.
+pub fn normalize_legacy_windows_extensions(conn: &Connection) -> Result<bool> {
+    let n = conn.execute(
+        "UPDATE platforms SET extensions = ?1 WHERE id = 'windows' AND extensions = ?2",
+        params![r#"["exe","bat","lnk"]"#, r#"["exe","bat","lnk","sh"]"#],
+    )?;
+    Ok(n > 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::Db;
+
+    #[test]
+    fn legacy_windows_extensions_are_normalized_once() {
+        let db = Db::open_in_memory().unwrap();
+        db.with(|c| {
+            c.execute(
+                "INSERT INTO platforms (id, name, short_name, extensions)
+                 VALUES ('windows','Windows','PC','[\"exe\",\"bat\",\"lnk\",\"sh\"]')",
+                [],
+            )?;
+            assert!(normalize_legacy_windows_extensions(c)?);
+            let p = get(c, "windows")?.unwrap();
+            assert_eq!(p.extensions, vec!["exe", "bat", "lnk"]);
+            // Second run is a no-op; customized lists are never rewritten.
+            assert!(!normalize_legacy_windows_extensions(c)?);
+            Ok(())
+        })
+        .unwrap();
+    }
+}

@@ -134,6 +134,7 @@ fn normalize_region(tag: &str) -> String {
     }
 }
 
+#[derive(Clone)]
 struct RomFile {
     path: String,
     file_name: String,
@@ -234,6 +235,12 @@ pub fn sync_rom_directory(
         .with(|c| platforms::get(c, &dir.platform_id))?
         .ok_or_else(|| AppError::NotFound(format!("platform {} not found", dir.platform_id)))?;
 
+    // Switch dumps ship a base game plus its update and many DLC files, all
+    // sharing one base application ID. Collapse them into one game per title.
+    if dir.platform_id == "switch" {
+        return sync_switch_directory(db, dir, &platform, cancel, progress, report);
+    }
+
     progress.report("discovering", 0, 0, &format!("Scanning {}", dir.path));
     if !Path::new(&dir.path).exists() {
         report
@@ -323,6 +330,234 @@ pub fn sync_rom_directory(
             Ok(())
         })?;
     }
+    Ok(())
+}
+
+/// Scan a Nintendo Switch directory, collapsing each game's base / update /
+/// DLC files into a single library entry keyed by base application ID. Skips
+/// homebrew (`.nro`) tools. Self-healing: pre-existing per-file duplicates for
+/// the same base ID are merged into one game (favorite/edits preserved).
+fn sync_switch_directory(
+    db: &Db,
+    dir: &RomDirectory,
+    platform: &Platform,
+    cancel: &AtomicBool,
+    progress: &ProgressSink,
+    report: &mut ScanReport,
+) -> Result<()> {
+    progress.report("discovering", 0, 0, &format!("Scanning {}", dir.path));
+    if !Path::new(&dir.path).exists() {
+        report
+            .errors
+            .push(format!("directory not found: {}", dir.path));
+        return Ok(());
+    }
+    let all_files = collect_rom_files(dir, platform, cancel)?;
+
+    // Group files by base application ID; files without a title ID stay
+    // standalone; `.nro` homebrew is skipped entirely.
+    let mut groups: HashMap<u64, Vec<RomFile>> = HashMap::new();
+    let mut standalone: Vec<RomFile> = Vec::new();
+    for file in all_files {
+        if file.file_name.to_lowercase().ends_with(".nro") {
+            report.skipped += 1;
+            continue;
+        }
+        match crate::switch_art::extract_title_id(&file.file_name) {
+            Some(tid) => groups
+                .entry(crate::switch_art::base_app_id(tid))
+                .or_default()
+                .push(file),
+            None => standalone.push(file),
+        }
+    }
+
+    let total = (groups.len() + standalone.len()) as u32;
+    let mut index = 0u32;
+    let emulator_id = dir
+        .emulator_id
+        .clone()
+        .or_else(|| platform.default_emulator_id.clone());
+
+    for (base, mut files) in groups {
+        if cancel.load(Ordering::SeqCst) {
+            return Err(AppError::Cancelled);
+        }
+        // Pick the bootable file: base > update > DLC, then largest.
+        files.sort_by_key(|f| {
+            let tid = crate::switch_art::extract_title_id(&f.file_name).unwrap_or(0);
+            (
+                crate::switch_art::title_kind_priority(tid),
+                std::cmp::Reverse(f.size),
+            )
+        });
+        let primary = files[0].clone();
+        let base_hex = format!("{base:016X}");
+        let group_paths: Vec<String> = files.iter().map(|f| f.path.clone()).collect();
+        index += 1;
+        progress.report("importing", index, total, &primary.file_name);
+
+        db.with(|c| {
+            reconcile_switch_group(
+                c,
+                &base_hex,
+                &primary,
+                &group_paths,
+                emulator_id.as_deref(),
+                report,
+            )
+        })?;
+    }
+
+    // Standalone files (no title ID): one game per file, deduped by path.
+    for file in standalone {
+        if cancel.load(Ordering::SeqCst) {
+            return Err(AppError::Cancelled);
+        }
+        index += 1;
+        progress.report("importing", index, total, &file.file_name);
+        db.with(|c| upsert_standalone_rom(c, dir, platform, &file, report))?;
+    }
+
+    Ok(())
+}
+
+/// Collapse all existing games tied to a base ID into one, or create it.
+fn reconcile_switch_group(
+    conn: &Connection,
+    base_hex: &str,
+    primary: &RomFile,
+    group_paths: &[String],
+    emulator_id: Option<&str>,
+    report: &mut ScanReport,
+) -> Result<()> {
+    // Existing games for this base: the canonical row (source_id = base_hex)
+    // plus any legacy per-file rows (source_id = a path in the group).
+    let mut game_ids: Vec<String> = Vec::new();
+    let mut push = |id: String| {
+        if !game_ids.contains(&id) {
+            game_ids.push(id);
+        }
+    };
+    if let Some(gid) = game_id_for_source(conn, base_hex)? {
+        push(gid);
+    }
+    for path in group_paths {
+        if let Some(gid) = game_id_for_source(conn, path)? {
+            push(gid);
+        }
+    }
+
+    if game_ids.is_empty() {
+        let (title, region) = title_from_filename(&primary.file_name);
+        let game = games::insert(
+            conn,
+            &games::NewGame {
+                title: &title,
+                platform_id: "switch",
+                release_date: None,
+                region: region.as_deref(),
+            },
+        )?;
+        conn.execute(
+            "INSERT INTO installations (id, game_id, source_type, source_id, path, emulator_id, installed, file_size)
+             VALUES (?1, ?2, 'rom', ?3, ?4, ?5, 1, ?6)",
+            params![repo::new_id(), game.id, base_hex, primary.path, emulator_id, primary.size],
+        )?;
+        report.added += 1;
+        return Ok(());
+    }
+
+    // Keep the favorite (or earliest-created) game; delete the rest.
+    game_ids.sort_by_key(|id| game_sort_key(conn, id).unwrap_or((true, i64::MAX)));
+    let keep = game_ids[0].clone();
+    let mut merged = false;
+    for gid in &game_ids[1..] {
+        games::delete(conn, gid)?;
+        merged = true;
+    }
+
+    // Normalize the kept game to a single canonical installation. Skip the
+    // rewrite when it already matches, so unchanged rescans stay quiet.
+    let already_canonical: bool = conn
+        .query_row(
+            "SELECT COUNT(*) = 1 AND MAX(CASE WHEN source_id = ?2 AND path = ?3 AND installed = 1 THEN 1 ELSE 0 END) = 1
+             FROM installations WHERE game_id = ?1",
+            params![keep, base_hex, primary.path],
+            |r| r.get::<_, bool>(0),
+        )
+        .unwrap_or(false);
+
+    if already_canonical && !merged {
+        report.skipped += 1;
+        return Ok(());
+    }
+    conn.execute("DELETE FROM installations WHERE game_id = ?1", [&keep])?;
+    conn.execute(
+        "INSERT INTO installations (id, game_id, source_type, source_id, path, emulator_id, installed, file_size)
+         VALUES (?1, ?2, 'rom', ?3, ?4, ?5, 1, ?6)",
+        params![repo::new_id(), keep, base_hex, primary.path, emulator_id, primary.size],
+    )?;
+    report.updated += 1;
+    Ok(())
+}
+
+fn game_id_for_source(conn: &Connection, source_id: &str) -> Result<Option<String>> {
+    Ok(conn
+        .query_row(
+            "SELECT game_id FROM installations WHERE source_type = 'rom' AND source_id = ?1",
+            [source_id],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?)
+}
+
+/// (not-favorite, rowid) sort key: favorites first, then creation order.
+fn game_sort_key(conn: &Connection, game_id: &str) -> Result<(bool, i64)> {
+    Ok(conn.query_row(
+        "SELECT favorite = 0, rowid FROM games WHERE id = ?1",
+        [game_id],
+        |r| Ok((r.get::<_, bool>(0)?, r.get::<_, i64>(1)?)),
+    )?)
+}
+
+/// Insert/refresh a single-file ROM game (used for Switch files without a
+/// title ID, e.g. loose `Game.nsp`).
+fn upsert_standalone_rom(
+    conn: &Connection,
+    dir: &RomDirectory,
+    platform: &Platform,
+    file: &RomFile,
+    report: &mut ScanReport,
+) -> Result<()> {
+    if find_installation_by_source(conn, "rom", &file.path)?.is_some() {
+        report.skipped += 1;
+        return Ok(());
+    }
+    let (title, region) = title_from_filename(&file.file_name);
+    if title.is_empty() {
+        report.skipped += 1;
+        return Ok(());
+    }
+    let game = games::insert(
+        conn,
+        &games::NewGame {
+            title: &title,
+            platform_id: &dir.platform_id,
+            release_date: None,
+            region: region.as_deref(),
+        },
+    )?;
+    let emulator_id = dir
+        .emulator_id
+        .clone()
+        .or_else(|| platform.default_emulator_id.clone());
+    conn.execute(
+        "INSERT INTO installations (id, game_id, source_type, source_id, path, emulator_id, installed, file_size)
+         VALUES (?1, ?2, 'rom', ?3, ?3, ?4, 1, ?5)",
+        params![repo::new_id(), game.id, file.path, emulator_id, file.size],
+    )?;
+    report.added += 1;
     Ok(())
 }
 
@@ -575,6 +810,170 @@ mod tests {
             scan_id: "test".into(),
             source: "test".into(),
         }
+    }
+
+    fn switch_dir(db: &Db, path: &str) -> RomDirectory {
+        db.with(|c| {
+            c.execute(
+                "INSERT OR IGNORE INTO platforms (id, name, short_name, extensions) VALUES ('switch','Nintendo Switch','Switch','[\"nsp\",\"xci\",\"nca\",\"nro\"]')",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        RomDirectory {
+            id: "swdir".into(),
+            path: path.into(),
+            platform_id: "switch".into(),
+            emulator_id: None,
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn switch_collapses_base_update_and_dlc_into_one_game() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dlc = tmp.path().join("Smash [DLC]");
+        std::fs::create_dir_all(&dlc).unwrap();
+        // Base, update and three DLC files for Smash (base 01006A800016E000),
+        // plus a homebrew tool and a standalone game without a title ID.
+        std::fs::write(
+            tmp.path()
+                .join("Super Smash Bros Ultimate [01006A800016E000][v0].nsp"),
+            b"BASEDATA",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path()
+                .join("Super Smash Bros Ultimate [01006A800016E800][v983040].nsp"),
+            b"UPD",
+        )
+        .unwrap();
+        std::fs::write(
+            dlc.join("Smash [Challenger Pack 1] [01006A800016F002].nsp"),
+            b"d1",
+        )
+        .unwrap();
+        std::fs::write(
+            dlc.join("Smash [Challenger Pack 2] [01006A800016F003].nsp"),
+            b"d2",
+        )
+        .unwrap();
+        std::fs::write(
+            dlc.join("Smash [Spirit Pack] [01006A800016F070].nsp"),
+            b"d3",
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join("JKSV.nro"), b"homebrew").unwrap();
+        std::fs::write(tmp.path().join("Super Mario Odyssey.nsp"), b"odyssey").unwrap();
+
+        let db = Db::open_in_memory().unwrap();
+        let dir = switch_dir(&db, tmp.path().to_str().unwrap());
+        let cancel = AtomicBool::new(false);
+        let mut report = ScanReport::default();
+        sync_rom_directory(&db, &dir, &cancel, &sink(), &mut report).unwrap();
+
+        // Two games: Smash (collapsed) + Mario Odyssey (standalone). No homebrew.
+        let count: i64 = db
+            .with(|c| Ok(c.query_row("SELECT COUNT(*) FROM games", [], |r| r.get(0))?))
+            .unwrap();
+        assert_eq!(count, 2, "base+update+3 DLC should collapse to one game");
+
+        // The Smash installation points at the base file and is keyed by base id.
+        let (path, source_id): (String, String) = db
+            .with(|c| {
+                Ok(c.query_row(
+                    "SELECT i.path, i.source_id FROM installations i JOIN games g ON g.id = i.game_id
+                     WHERE g.title LIKE 'Super Smash%'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?)
+            })
+            .unwrap();
+        assert!(
+            path.ends_with("01006A800016E000][v0].nsp"),
+            "should boot the base file, got {path}"
+        );
+        assert_eq!(source_id, "01006A800016E000");
+    }
+
+    #[test]
+    fn switch_rescan_is_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("Zelda TOTK [0100F2C0115B6000][v0].xci"),
+            b"totk",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("Zelda TOTK [0100F2C0115B6800][v1].nsp"),
+            b"totkupd",
+        )
+        .unwrap();
+
+        let db = Db::open_in_memory().unwrap();
+        let dir = switch_dir(&db, tmp.path().to_str().unwrap());
+        let cancel = AtomicBool::new(false);
+
+        let mut r1 = ScanReport::default();
+        sync_rom_directory(&db, &dir, &cancel, &sink(), &mut r1).unwrap();
+        assert_eq!(r1.added, 1);
+
+        let mut r2 = ScanReport::default();
+        sync_rom_directory(&db, &dir, &cancel, &sink(), &mut r2).unwrap();
+        assert_eq!(r2.added, 0);
+        let count: i64 = db
+            .with(|c| Ok(c.query_row("SELECT COUNT(*) FROM games", [], |r| r.get(0))?))
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn switch_merges_existing_duplicates_and_keeps_favorite() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("Smash [01006A800016E000][v0].nsp");
+        let dlc = tmp.path().join("Smash [Pack] [01006A800016F002].nsp");
+        std::fs::write(&base, b"base").unwrap();
+        std::fs::write(&dlc, b"dlc").unwrap();
+
+        let db = Db::open_in_memory().unwrap();
+        let dir = switch_dir(&db, tmp.path().to_str().unwrap());
+
+        // Simulate the OLD scanner: one game per file, source_id = path. Mark
+        // the DLC-derived game as the favorite to prove the merge keeps it.
+        db.with(|c| {
+            for (title, path, fav) in [
+                ("Smash base", base.to_str().unwrap(), false),
+                ("Smash dlc", dlc.to_str().unwrap(), true),
+            ] {
+                let g = games::insert(c, &games::NewGame { title, platform_id: "switch", release_date: None, region: None })?;
+                c.execute("UPDATE games SET favorite = ?2 WHERE id = ?1", params![g.id, fav])?;
+                c.execute(
+                    "INSERT INTO installations (id, game_id, source_type, source_id, path, installed)
+                     VALUES (?1, ?2, 'rom', ?3, ?3, 1)",
+                    params![repo::new_id(), g.id, path],
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
+
+        let cancel = AtomicBool::new(false);
+        let mut report = ScanReport::default();
+        sync_rom_directory(&db, &dir, &cancel, &sink(), &mut report).unwrap();
+
+        // Collapsed to one game, and the favorited one survived.
+        let (count, favorite): (i64, bool) = db
+            .with(|c| {
+                Ok(
+                    c.query_row("SELECT COUNT(*), MAX(favorite) FROM games", [], |r| {
+                        Ok((r.get(0)?, r.get(1)?))
+                    })?,
+                )
+            })
+            .unwrap();
+        assert_eq!(count, 1, "duplicates should merge into one");
+        assert!(favorite, "the favorited duplicate should be the survivor");
     }
 
     #[test]

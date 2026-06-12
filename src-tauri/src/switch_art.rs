@@ -41,6 +41,25 @@ pub fn extract_title_id(name: &str) -> Option<u64> {
     None
 }
 
+/// The base application ID that owns a title (base game, update or DLC).
+///
+/// Switch base IDs are multiples of 0x2000 (low 13 bits zero); updates set the
+/// 0x800 bit and DLC add 0x1000 + n, so masking off the low 13 bits recovers
+/// the owning application for all three.
+pub fn base_app_id(title_id: u64) -> u64 {
+    title_id & 0xFFFF_FFFF_FFFF_E000
+}
+
+/// Launch priority of a title within its group: base (0) < update (1) < DLC (2).
+/// Used to pick the bootable file when collapsing a game's files into one entry.
+pub fn title_kind_priority(title_id: u64) -> u8 {
+    match title_id & 0x1FFF {
+        0x000 => 0, // base application
+        0x800 => 1, // update / patch
+        _ => 2,     // add-on content (DLC)
+    }
+}
+
 /// Candidate base application IDs (uppercase hex) for an arbitrary title ID.
 /// Handles base titles, updates (`…800`) and DLC (`base + 0x1000 + n`).
 pub fn base_candidates(title_id: u64) -> Vec<String> {
@@ -168,6 +187,22 @@ mod tests {
         // DLC 01006F800232712D → owning app 01006F8002326000.
         let bases = base_candidates(0x01006F800232712D);
         assert!(bases.contains(&"01006F8002326000".to_string()));
+    }
+
+    #[test]
+    fn base_app_id_collapses_base_update_and_dlc() {
+        // Smash base, update and DLC all share base 01006A800016E000.
+        assert_eq!(base_app_id(0x01006A800016E000), 0x01006A800016E000);
+        assert_eq!(base_app_id(0x01006A800016E800), 0x01006A800016E000);
+        assert_eq!(base_app_id(0x01006A800016F002), 0x01006A800016E000); // Challenger Pack 1
+        assert_eq!(base_app_id(0x01006A800016F070), 0x01006A800016E000); // Spirit pack
+    }
+
+    #[test]
+    fn title_kind_priority_orders_base_first() {
+        assert_eq!(title_kind_priority(0x01006A800016E000), 0); // base
+        assert_eq!(title_kind_priority(0x01006A800016E800), 1); // update
+        assert_eq!(title_kind_priority(0x01006A800016F002), 2); // DLC
     }
 
     /// Live tinfoil.media check — downloads the eShop icon for a real title ID.

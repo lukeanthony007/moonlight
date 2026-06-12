@@ -21,6 +21,7 @@ use crate::error::Result;
 use crate::libretro_art;
 use crate::metadata::{self, MetadataProvider, SearchQuery};
 use crate::scan::ProgressSink;
+use crate::switch_art;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -80,8 +81,10 @@ pub fn has_any_source(db: &Db, platform_filter: Option<&str>) -> bool {
     }
     missing_artwork_targets(db, platform_filter)
         .map(|t| {
-            t.iter()
-                .any(|g| libretro_art::system_for(&g.platform_id).is_some())
+            t.iter().any(|g| {
+                libretro_art::system_for(&g.platform_id).is_some()
+                    || switch_art::can_match(g.rom_path.as_deref())
+            })
         })
         .unwrap_or(false)
 }
@@ -227,7 +230,21 @@ pub fn run_enrich(
                 }
             }
 
-            // 2. Fall back to the configured provider (fuzzy title search).
+            // 2. Nintendo Switch art via title ID (free, no key).
+            if !got && target.platform_id == "switch" {
+                match switch_art::fetch_for_game(
+                    db,
+                    artwork_dir,
+                    &target.id,
+                    target.rom_path.as_deref(),
+                ) {
+                    Ok(true) => got = true,
+                    Ok(false) => {}
+                    Err(e) => tracing::warn!(game = %target.title, error = %e, "switch art failed"),
+                }
+            }
+
+            // 3. Fall back to the configured provider (fuzzy title search).
             if !got {
                 if let Some(provider) = provider.as_deref() {
                     match try_provider(db, artwork_dir, provider, target) {

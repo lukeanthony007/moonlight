@@ -12,6 +12,7 @@ pub mod paths;
 pub mod retroarch;
 pub mod scan;
 pub mod steam;
+pub mod switch_art;
 
 use commands::AppState;
 use db::repo::{platforms, sessions, settings};

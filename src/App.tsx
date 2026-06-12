@@ -68,6 +68,12 @@ export default function App() {
       listen<ScanReport>("scan-complete", (e) => {
         scanStore.onComplete(e.payload);
         void refresh();
+        // After a library scan, automatically fetch artwork for any games
+        // still missing it (libretro thumbnails need no key). The artwork pass
+        // itself emits a "scan-complete" with source "artwork" — don't recurse.
+        if (e.payload.source !== "artwork" && !e.payload.cancelled) {
+          void api.enrichArtwork().catch(() => {});
+        }
       }),
       listen("session-started", () => {
         void api.getRunningGames().then(useLibraryStore.getState().setRunning);

@@ -2,18 +2,24 @@
 //!
 //! Steam games arrive with the Steam client's cached artwork, but ROM and
 //! manual games have no local art source. This job walks every game missing
-//! box art, searches the configured metadata provider, and downloads box art,
-//! background and logo (plus merges textual metadata, respecting locks).
+//! box art and fills it in, preferring two sources per game:
 //!
-//! It reuses the scan progress/registry plumbing so the existing UI banner
-//! reports progress and results.
+//! 1. **libretro-thumbnails** — a free, no-key public CDN, used for any ROM
+//!    platform it covers (matched by No-Intro / Redump filename).
+//! 2. The configured **metadata provider** (e.g. SteamGridDB) — fuzzy title
+//!    search, used as a fallback and for platforms libretro doesn't cover.
+//!
+//! At least one source is usually available, so enrichment works with zero
+//! configuration. It reuses the scan progress/registry plumbing so the
+//! existing UI banner reports progress and results.
 
 use crate::artwork_store;
 use crate::db::repo::{artwork, games};
 use crate::db::Db;
 use crate::domain::ScanReport;
 use crate::error::Result;
-use crate::metadata::{self, SearchQuery};
+use crate::libretro_art;
+use crate::metadata::{self, MetadataProvider, SearchQuery};
 use crate::scan::ProgressSink;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -29,12 +35,16 @@ struct Target {
     title: String,
     release_date: Option<String>,
     platform_id: String,
+    rom_path: Option<String>,
 }
 
 fn missing_artwork_targets(db: &Db, platform_filter: Option<&str>) -> Result<Vec<Target>> {
     db.with(|c| {
         let mut stmt = c.prepare(
-            "SELECT g.id, g.title, g.release_date, g.platform_id FROM games g
+            "SELECT g.id, g.title, g.release_date, g.platform_id,
+                    (SELECT i.path FROM installations i
+                     WHERE i.game_id = g.id AND i.source_type = 'rom' LIMIT 1) AS rom_path
+             FROM games g
              WHERE g.platform_id != 'steam'
                AND NOT EXISTS (
                  SELECT 1 FROM artwork a
@@ -48,6 +58,7 @@ fn missing_artwork_targets(db: &Db, platform_filter: Option<&str>) -> Result<Vec
                 title: r.get(1)?,
                 release_date: r.get(2)?,
                 platform_id: r.get(3)?,
+                rom_path: r.get(4)?,
             })
         })?;
         let all = rows.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -58,10 +69,111 @@ fn missing_artwork_targets(db: &Db, platform_filter: Option<&str>) -> Result<Vec
     })
 }
 
+/// True if enrichment has any source available: a libretro-covered platform
+/// among the targets, or a configured metadata provider.
+pub fn has_any_source(db: &Db, platform_filter: Option<&str>) -> bool {
+    let provider_configured = metadata::provider_statuses(db)
+        .map(|s| s.iter().any(|p| p.configured))
+        .unwrap_or(false);
+    if provider_configured {
+        return true;
+    }
+    missing_artwork_targets(db, platform_filter)
+        .map(|t| {
+            t.iter()
+                .any(|g| libretro_art::system_for(&g.platform_id).is_some())
+        })
+        .unwrap_or(false)
+}
+
+/// Try the configured metadata provider for one target. Returns `true` if box
+/// art was stored. Errors propagate so the caller can rate-limit.
+fn try_provider(
+    db: &Db,
+    artwork_dir: &Path,
+    provider: &dyn MetadataProvider,
+    target: &Target,
+) -> Result<bool> {
+    let year = target
+        .release_date
+        .as_deref()
+        .and_then(|d| d.get(0..4))
+        .and_then(|y| y.parse::<i32>().ok());
+    let query = SearchQuery {
+        title: target.title.clone(),
+        platform_id: Some(target.platform_id.clone()),
+        region: None,
+        release_year: year,
+    };
+    let best = match provider
+        .search(&query)?
+        .into_iter()
+        .find(|m| m.confidence >= MIN_CONFIDENCE)
+    {
+        Some(b) => b,
+        None => return Ok(false),
+    };
+
+    // Merge textual metadata (locks respected inside the repo call).
+    if let Ok(meta) = provider.metadata(&best.provider_game_id) {
+        let _ = db.with(|c| {
+            games::merge_provider_metadata(
+                c,
+                &target.id,
+                &games::ProviderMetadata {
+                    provider: provider.id().to_string(),
+                    title: meta.title,
+                    description: meta.description,
+                    release_date: meta.release_date,
+                    developer: meta.developer,
+                    publisher: meta.publisher,
+                    genres: meta.genres,
+                },
+            )
+        });
+    }
+
+    let mut got_boxart = false;
+    for kind in ["boxart", "background", "logo"] {
+        if db
+            .with(|c| artwork::has_user_selected(c, &target.id, kind))
+            .unwrap_or(false)
+        {
+            continue; // never displace a user-selected image
+        }
+        match provider.artwork(&best.provider_game_id, kind) {
+            Ok(candidates) => {
+                if let Some(candidate) = candidates.first() {
+                    match artwork_store::download_url(
+                        db,
+                        artwork_dir,
+                        &target.id,
+                        kind,
+                        &candidate.url,
+                        provider.id(),
+                        false,
+                    ) {
+                        Ok(_) if kind == "boxart" => got_boxart = true,
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::warn!(kind, error = %e, "enrich artwork download failed")
+                        }
+                    }
+                }
+            }
+            Err(e) => tracing::warn!(kind, error = %e, "enrich artwork lookup failed"),
+        }
+    }
+    Ok(got_boxart)
+}
+
+/// `provider_id` is the optional configured metadata provider (e.g.
+/// SteamGridDB). libretro thumbnails are always tried first for covered
+/// platforms, with no key required.
 pub fn run_enrich(
     db: &Db,
     artwork_dir: &Path,
-    provider_id: &str,
+    provider_id: Option<&str>,
     platform_filter: Option<&str>,
     scan_id: String,
     cancel: Arc<AtomicBool>,
@@ -80,11 +192,15 @@ pub fn run_enrich(
     };
 
     let result: Result<()> = (|| {
-        let provider = metadata::get_provider(db, provider_id)?;
+        let provider = match provider_id {
+            Some(id) => metadata::get_provider(db, id).ok(),
+            None => None,
+        };
         let targets = missing_artwork_targets(db, platform_filter)?;
         let total = targets.len() as u32;
         progress.report("matching", 0, total, "Finding artwork");
 
+        let mut provider_errors = 0u32;
         for (index, target) in targets.iter().enumerate() {
             if cancel.load(Ordering::SeqCst) {
                 report.cancelled = true;
@@ -92,88 +208,46 @@ pub fn run_enrich(
             }
             progress.report("matching", index as u32 + 1, total, &target.title);
 
-            let year = target
-                .release_date
-                .as_deref()
-                .and_then(|d| d.get(0..4))
-                .and_then(|y| y.parse::<i32>().ok());
-            let query = SearchQuery {
-                title: target.title.clone(),
-                platform_id: Some(target.platform_id.clone()),
-                region: None,
-                release_year: year,
-            };
-
-            let best = match provider.search(&query) {
-                Ok(matches) => matches.into_iter().find(|m| m.confidence >= MIN_CONFIDENCE),
-                Err(e) => {
-                    report.errors.push(format!("{}: {e}", target.title));
-                    if report.errors.len() > 25 {
-                        // Likely a bad key or rate-limit wall; stop hammering.
-                        report
-                            .errors
-                            .push("too many provider errors — stopping".into());
-                        break;
+            // 1. libretro thumbnails (free, no key) for covered platforms.
+            let mut got = false;
+            if let Some(system) = libretro_art::system_for(&target.platform_id) {
+                match libretro_art::fetch_for_game(
+                    db,
+                    artwork_dir,
+                    &target.id,
+                    system,
+                    &target.title,
+                    target.rom_path.as_deref(),
+                ) {
+                    Ok(true) => got = true,
+                    Ok(false) => {}
+                    Err(e) => {
+                        tracing::warn!(game = %target.title, error = %e, "libretro art failed")
                     }
-                    continue;
                 }
-            };
-            let Some(best) = best else {
-                report.skipped += 1;
-                continue;
-            };
-
-            // Merge textual metadata (locks respected inside the repo call).
-            if let Ok(meta) = provider.metadata(&best.provider_game_id) {
-                let _ = db.with(|c| {
-                    games::merge_provider_metadata(
-                        c,
-                        &target.id,
-                        &games::ProviderMetadata {
-                            provider: provider_id.to_string(),
-                            title: meta.title,
-                            description: meta.description,
-                            release_date: meta.release_date,
-                            developer: meta.developer,
-                            publisher: meta.publisher,
-                            genres: meta.genres,
-                        },
-                    )
-                });
             }
 
-            let mut got_boxart = false;
-            for kind in ["boxart", "background", "logo"] {
-                if db
-                    .with(|c| artwork::has_user_selected(c, &target.id, kind))
-                    .unwrap_or(false)
-                {
-                    continue; // never displace a user-selected image
-                }
-                match provider.artwork(&best.provider_game_id, kind) {
-                    Ok(candidates) => {
-                        if let Some(candidate) = candidates.first() {
-                            match artwork_store::download_url(
-                                db,
-                                artwork_dir,
-                                &target.id,
-                                kind,
-                                &candidate.url,
-                                provider_id,
-                                false,
-                            ) {
-                                Ok(_) if kind == "boxart" => got_boxart = true,
-                                Ok(_) => {}
-                                Err(e) => {
-                                    tracing::warn!(kind, error = %e, "enrich artwork download failed")
-                                }
+            // 2. Fall back to the configured provider (fuzzy title search).
+            if !got {
+                if let Some(provider) = provider.as_deref() {
+                    match try_provider(db, artwork_dir, provider, target) {
+                        Ok(true) => got = true,
+                        Ok(false) => {}
+                        Err(e) => {
+                            provider_errors += 1;
+                            report.errors.push(format!("{}: {e}", target.title));
+                            if provider_errors > 25 {
+                                report
+                                    .errors
+                                    .push("too many provider errors — stopping".into());
+                                break;
                             }
                         }
                     }
-                    Err(e) => tracing::warn!(kind, error = %e, "enrich artwork lookup failed"),
                 }
             }
-            if got_boxart {
+
+            if got {
                 report.updated += 1;
             } else {
                 report.skipped += 1;
@@ -194,4 +268,98 @@ pub fn run_enrich(
         "artwork enrichment finished"
     );
     report
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::repo::{games, new_id};
+    use rusqlite::params;
+
+    fn seed(db: &Db, title: &str, rom_path: &str) {
+        db.with(|c| {
+            let game = games::insert(
+                c,
+                &games::NewGame {
+                    title,
+                    platform_id: "gamecube",
+                    release_date: None,
+                    region: None,
+                },
+            )?;
+            c.execute(
+                "INSERT INTO installations (id, game_id, source_type, source_id, path, installed)
+                 VALUES (?1, ?2, 'rom', ?3, ?3, 1)",
+                params![new_id(), game.id, rom_path],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    /// End-to-end against the live libretro CDN: seeds real GameCube ROM names
+    /// and verifies box art actually downloads. Network-dependent, so ignored
+    /// by default — run with `cargo test -- --ignored`.
+    #[test]
+    #[ignore]
+    fn libretro_enrichment_downloads_real_boxart() {
+        let db = Db::open_in_memory().unwrap();
+        db.with(|c| {
+            c.execute(
+                "INSERT INTO platforms (id, name, short_name) VALUES ('gamecube','GameCube','GCN')",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        // Region stripped from the title; the raw ROM filename keeps it.
+        seed(&db, "F-Zero GX", "/roms/F-Zero GX (USA).ciso");
+        seed(
+            &db,
+            "Animal Crossing",
+            "/roms/Animal Crossing (Europe) (En,Fr,De,Es,It).ciso",
+        );
+        seed(&db, "Amazing Island", "/roms/Amazing Island (USA).nkit.iso");
+
+        let dir = tempfile::tempdir().unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let report = run_enrich(
+            &db,
+            dir.path(),
+            None,
+            Some("gamecube"),
+            "test".into(),
+            cancel,
+            None,
+        );
+
+        assert!(
+            report.updated >= 3,
+            "expected all 3 to match, report = {report:?}"
+        );
+        let art_count: i64 = db
+            .with(|c| {
+                Ok(c.query_row(
+                    "SELECT COUNT(*) FROM artwork WHERE kind='boxart' AND provider='libretro' AND local_path IS NOT NULL",
+                    [],
+                    |r| r.get(0),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(art_count, 3);
+
+        // The downloaded files exist on disk and are non-trivial PNGs.
+        let files: Vec<String> = db
+            .with(|c| {
+                let mut stmt = c.prepare("SELECT local_path FROM artwork WHERE kind='boxart'")?;
+                let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+                Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+            })
+            .unwrap();
+        for path in files {
+            let size = std::fs::metadata(&path).unwrap().len();
+            assert!(size > 1000, "{path} is suspiciously small ({size} bytes)");
+        }
+    }
 }

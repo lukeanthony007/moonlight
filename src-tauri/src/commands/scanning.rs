@@ -67,17 +67,19 @@ pub async fn enrich_artwork(
     state: State<'_, AppState>,
     platform_id: Option<String>,
 ) -> Result<String> {
+    // libretro thumbnails need no key; the configured provider (if any) is a
+    // fuzzy fallback. Only fail when neither source can serve any target.
+    if !crate::enrich::has_any_source(&state.db, platform_id.as_deref()) {
+        return Err(AppError::Provider(
+            "No artwork source for these games. Add a SteamGridDB API key in Settings → Metadata \
+             Providers to fetch artwork for platforms libretro doesn't cover."
+                .into(),
+        ));
+    }
     let provider_id = metadata::provider_statuses(&state.db)?
         .into_iter()
         .find(|p| p.configured)
-        .map(|p| p.id)
-        .ok_or_else(|| {
-            AppError::Provider(
-                "No metadata provider is configured. Add an API key in Settings → Metadata Providers \
-                 to fetch artwork for ROM and manually-added games."
-                    .into(),
-            )
-        })?;
+        .map(|p| p.id);
 
     let scan_id = uuid::Uuid::new_v4().to_string();
     let registry = app.state::<ScanRegistry>();
@@ -90,7 +92,7 @@ pub async fn enrich_artwork(
         let report = crate::enrich::run_enrich(
             &db,
             &artwork_dir,
-            &provider_id,
+            provider_id.as_deref(),
             platform_id.as_deref(),
             scan_id.clone(),
             cancel,

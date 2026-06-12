@@ -6,6 +6,7 @@ pub mod domain;
 pub mod enrich;
 pub mod error;
 pub mod launch;
+pub mod libretro_art;
 pub mod metadata;
 pub mod paths;
 pub mod retroarch;

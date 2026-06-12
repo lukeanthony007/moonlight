@@ -41,16 +41,19 @@ struct Target {
 
 fn missing_artwork_targets(db: &Db, platform_filter: Option<&str>) -> Result<Vec<Target>> {
     db.with(|c| {
+        // Target games missing box art, plus Switch games that have art but no
+        // official metadata yet (so their names get corrected once).
         let mut stmt = c.prepare(
             "SELECT g.id, g.title, g.release_date, g.platform_id,
                     (SELECT i.path FROM installations i
                      WHERE i.game_id = g.id AND i.source_type = 'rom' LIMIT 1) AS rom_path
              FROM games g
              WHERE g.platform_id != 'steam'
-               AND NOT EXISTS (
-                 SELECT 1 FROM artwork a
-                 WHERE a.game_id = g.id AND a.kind = 'boxart' AND a.local_path IS NOT NULL
-               )
+               AND ( NOT EXISTS (
+                       SELECT 1 FROM artwork a
+                       WHERE a.game_id = g.id AND a.kind = 'boxart' AND a.local_path IS NOT NULL
+                     )
+                     OR (g.platform_id = 'switch' AND g.provider_metadata IS NULL) )
              ORDER BY g.sort_title",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -211,21 +214,62 @@ pub fn run_enrich(
             }
             progress.report("matching", index as u32 + 1, total, &target.title);
 
+            // 0. Switch: pull the official eShop name / publisher / description
+            //    so e.g. "TOTK" becomes its real title. Respects locked fields.
+            if target.platform_id == "switch" {
+                if let Some(tid) = target
+                    .rom_path
+                    .as_deref()
+                    .and_then(switch_art::extract_title_id_from_path)
+                {
+                    if let Some(meta) = switch_art::fetch_metadata(tid) {
+                        let _ = db.with(|c| {
+                            games::merge_provider_metadata(
+                                c,
+                                &target.id,
+                                &games::ProviderMetadata {
+                                    provider: "nintendo".into(),
+                                    title: meta.name,
+                                    description: meta.description,
+                                    release_date: None,
+                                    developer: None,
+                                    publisher: meta.publisher,
+                                    genres: None,
+                                },
+                            )
+                        });
+                    }
+                }
+            }
+
+            // Skip artwork lookups when box art is already present (e.g. a
+            // Switch game re-targeted only to fetch its official metadata).
+            let mut got = db
+                .with(|c| {
+                    Ok(c.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM artwork WHERE game_id = ?1 AND kind = 'boxart' AND local_path IS NOT NULL)",
+                        [&target.id],
+                        |r| r.get::<_, bool>(0),
+                    )?)
+                })
+                .unwrap_or(false);
+
             // 1. libretro thumbnails (free, no key) for covered platforms.
-            let mut got = false;
-            if let Some(system) = libretro_art::system_for(&target.platform_id) {
-                match libretro_art::fetch_for_game(
-                    db,
-                    artwork_dir,
-                    &target.id,
-                    system,
-                    &target.title,
-                    target.rom_path.as_deref(),
-                ) {
-                    Ok(true) => got = true,
-                    Ok(false) => {}
-                    Err(e) => {
-                        tracing::warn!(game = %target.title, error = %e, "libretro art failed")
+            if !got {
+                if let Some(system) = libretro_art::system_for(&target.platform_id) {
+                    match libretro_art::fetch_for_game(
+                        db,
+                        artwork_dir,
+                        &target.id,
+                        system,
+                        &target.title,
+                        target.rom_path.as_deref(),
+                    ) {
+                        Ok(true) => got = true,
+                        Ok(false) => {}
+                        Err(e) => {
+                            tracing::warn!(game = %target.title, error = %e, "libretro art failed")
+                        }
                     }
                 }
             }

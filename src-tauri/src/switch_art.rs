@@ -14,6 +14,52 @@
 use crate::artwork_store;
 use crate::db::Db;
 use crate::error::Result;
+use std::time::Duration;
+
+/// Official eShop metadata for a Switch title (keyless, via tinfoil.media).
+#[derive(Debug, Clone)]
+pub struct SwitchMeta {
+    pub name: Option<String>,
+    pub publisher: Option<String>,
+    pub description: Option<String>,
+}
+
+/// Fetch the official name / publisher / description for a Switch title from
+/// the keyless tinfoil.media title API. Trademark glyphs are stripped from the
+/// name for tidy display. Returns `None` on network error or unknown title.
+pub fn fetch_metadata(title_id: u64) -> Option<SwitchMeta> {
+    let base = format!("{:016X}", base_app_id(title_id));
+    let url = format!("https://tinfoil.media/api/title/{base}");
+    let body: serde_json::Value = ureq::get(&url)
+        .timeout(Duration::from_secs(20))
+        .call()
+        .ok()?
+        .into_json()
+        .ok()?;
+
+    let strip = |s: &str| {
+        s.replace(['™', '®', '©'], "")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let field = |key: &str| {
+        body.get(key)
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+    let name = field("name").map(|n| strip(&n)).filter(|s| !s.is_empty());
+    let meta = SwitchMeta {
+        name,
+        publisher: field("publisher"),
+        description: field("description"),
+    };
+    if meta.name.is_none() && meta.description.is_none() {
+        return None;
+    }
+    Some(meta)
+}
 
 /// Extract the first 16-hex-digit title ID from a ROM filename, if present.
 pub fn extract_title_id(name: &str) -> Option<u64> {

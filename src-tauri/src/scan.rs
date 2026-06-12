@@ -552,6 +552,15 @@ fn delete_homebrew_games(conn: &Connection, report: &mut ScanReport) -> Result<(
     Ok(())
 }
 
+/// A scene-release / bare-version name that is never a real game title
+/// (`v-prince…`, `sxs-mk8u`, `v131072`). Case-sensitive on the lowercase `v-`
+/// prefix so legitimate titles like `V-Rally` are not affected.
+fn is_scene_release(title: &str) -> bool {
+    title.starts_with("v-")
+        || title.starts_with("sxs")
+        || title.chars().next().is_some_and(|c| c.is_ascii_digit())
+}
+
 /// Score a candidate title: more alphabetic content is better; scene-release
 /// and bare-version names (`v-…`, `sxs-…`, `v131072`) are heavily penalized.
 fn title_score(title: &str) -> i32 {
@@ -644,7 +653,9 @@ fn upsert_standalone_rom(
         return Ok(());
     }
     let (title, region) = title_from_filename(&file.file_name);
-    if title.is_empty() {
+    if title.is_empty() || is_scene_release(&title) {
+        // Empty or scene-release junk (`v-prince…`, `sxs-…`) — usually a loose
+        // copy of a properly-foldered dump. Don't create a game for it.
         report.skipped += 1;
         return Ok(());
     }
@@ -1089,6 +1100,43 @@ mod tests {
             titles,
             vec!["Prince Of Persia - The Lost Crown"],
             "got {titles:?}"
+        );
+    }
+
+    #[test]
+    fn switch_skips_loose_scene_release_duplicate() {
+        // A properly-foldered game plus a loose scene-named copy at the root.
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = tmp
+            .path()
+            .join("Prince Of Persia - The Lost Crown [0100210019428000]");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("prince [0100210019428000][v0].nsp"), b"base").unwrap();
+        std::fs::write(
+            tmp.path().join("v-prince_of_persia_the_lost_crown.nsp"),
+            b"loose",
+        )
+        .unwrap();
+
+        let db = Db::open_in_memory().unwrap();
+        let dir = switch_dir(&db, tmp.path().to_str().unwrap());
+        let cancel = AtomicBool::new(false);
+        let mut report = ScanReport::default();
+        sync_rom_directory(&db, &dir, &cancel, &sink(), &mut report).unwrap();
+
+        let titles: Vec<String> = db
+            .with(|c| {
+                let mut stmt = c.prepare("SELECT title FROM games")?;
+                let r = stmt
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(r)
+            })
+            .unwrap();
+        assert_eq!(
+            titles,
+            vec!["Prince Of Persia - The Lost Crown"],
+            "loose v- copy should be skipped, got {titles:?}"
         );
     }
 

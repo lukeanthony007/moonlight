@@ -25,6 +25,10 @@ export const GameCard = memo(function GameCard({
   onToggleFavorite,
 }: GameCardProps) {
   const [imageLoaded, setImageLoaded] = useState(false);
+  // Track aspect: portrait box art (GameCube/Switch/Steam) fills the 3:4 card;
+  // square/landscape covers (PS1 jewel cases) are shown whole over a blurred
+  // fill so nothing important gets cropped.
+  const [portrait, setPortrait] = useState(true);
   const boxart = artworkUrl(game.artwork.boxart);
   const year = releaseYear(game.releaseDate);
   const installed = game.installations.some((i) => i.installed);
@@ -46,18 +50,33 @@ export const GameCard = memo(function GameCard({
     >
       <div className="relative aspect-[3/4] w-full overflow-hidden bg-[#15151e]">
         {boxart ? (
-          <img
-            src={boxart}
-            alt=""
-            loading="lazy"
-            draggable={false}
-            onLoad={() => setImageLoaded(true)}
-            className={cn(
-              "h-full w-full object-cover transition-all duration-500",
-              imageLoaded ? "opacity-100 blur-0" : "opacity-0 blur-md",
-              "group-hover:scale-[1.04]",
+          <>
+            {!portrait && (
+              <img
+                src={boxart}
+                alt=""
+                aria-hidden
+                draggable={false}
+                className="absolute inset-0 h-full w-full scale-110 object-cover opacity-40 blur-2xl"
+              />
             )}
-          />
+            <img
+              src={boxart}
+              alt=""
+              loading="lazy"
+              draggable={false}
+              onLoad={(e) => {
+                const img = e.currentTarget;
+                setPortrait(img.naturalHeight >= img.naturalWidth * 1.15);
+                setImageLoaded(true);
+              }}
+              className={cn(
+                "relative h-full w-full transition-all duration-500",
+                portrait ? "object-cover group-hover:scale-[1.04]" : "object-contain",
+                imageLoaded ? "opacity-100 blur-0" : "opacity-0 blur-md",
+              )}
+            />
+          </>
         ) : (
           <div className="flex h-full w-full flex-col items-center justify-center gap-3 p-4 text-center">
             <Gamepad2 className="size-10 text-ink-faint" />

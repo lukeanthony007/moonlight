@@ -141,17 +141,35 @@ struct RomFile {
     size: i64,
 }
 
+/// CD-image track extensions that belong to a `.cue`/`.gdi`/`.ccd` sheet and
+/// must not be imported as their own games.
+const TRACK_EXTENSIONS: &[&str] = &["bin", "img", "wav", "iso"];
+/// Playlist / cue-sheet extensions whose presence in a folder means the track
+/// files in that folder are part of a disc image.
+const PLAYLIST_EXTENSIONS: &[&str] = &["cue", "ccd", "gdi"];
+
+fn ext_of(path: &std::path::Path) -> String {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase()
+}
+
 fn collect_rom_files(
     dir: &RomDirectory,
     platform: &Platform,
     cancel: &AtomicBool,
 ) -> Result<Vec<RomFile>> {
-    let mut files = Vec::new();
     let extensions: Vec<String> = platform
         .extensions
         .iter()
         .map(|e| e.to_lowercase())
         .collect();
+
+    // First pass: collect every file and note which directories contain a
+    // cue/gdi/ccd sheet (so we can drop their raw track files).
+    let mut all = Vec::new();
+    let mut playlist_dirs: std::collections::HashSet<std::path::PathBuf> = Default::default();
     for entry in WalkDir::new(&dir.path)
         .follow_links(true)
         .into_iter()
@@ -163,20 +181,31 @@ fn collect_rom_files(
         if !entry.file_type().is_file() {
             continue;
         }
-        let path = entry.path();
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("")
-            .to_lowercase();
+        let path = entry.path().to_path_buf();
+        if PLAYLIST_EXTENSIONS.contains(&ext_of(&path).as_str()) {
+            if let Some(parent) = path.parent() {
+                playlist_dirs.insert(parent.to_path_buf());
+            }
+        }
+        all.push(path);
+    }
+
+    let mut files = Vec::new();
+    for path in all {
+        let ext = ext_of(&path);
         if !extensions.is_empty() && !extensions.contains(&ext) {
             continue;
         }
-        // Multi-track formats: skip .bin files when a sibling .cue exists.
-        if ext == "bin" && path.with_extension("cue").exists() {
+        // Skip raw CD tracks (`.bin`/`.img`/`.wav`/`.iso`) when a cue sheet in
+        // the same folder references them — only the `.cue` is the game.
+        if TRACK_EXTENSIONS.contains(&ext.as_str())
+            && path.parent().is_some_and(|p| playlist_dirs.contains(p))
+        {
             continue;
         }
-        let size = entry.metadata().map(|m| m.len() as i64).unwrap_or(0);
+        let size = std::fs::metadata(&path)
+            .map(|m| m.len() as i64)
+            .unwrap_or(0);
         files.push(RomFile {
             path: path.to_string_lossy().to_string(),
             file_name: path
@@ -188,6 +217,46 @@ fn collect_rom_files(
         });
     }
     Ok(files)
+}
+
+/// Delete games whose ROM installation is a raw CD track (`.bin`/`.img`/…)
+/// that a `.cue`/`.gdi`/`.ccd` in the same folder supersedes — leftovers from
+/// before track files were skipped.
+fn purge_superseded_track_games(
+    conn: &Connection,
+    dir: &RomDirectory,
+    report: &mut ScanReport,
+) -> Result<()> {
+    let mut stmt = conn.prepare(
+        "SELECT g.id, i.path FROM games g JOIN installations i ON i.game_id = g.id
+         WHERE g.platform_id = ?1 AND i.source_type = 'rom' AND i.path LIKE ?2",
+    )?;
+    let rows: Vec<(String, String)> = stmt
+        .query_map(params![dir.platform_id, format!("{}%", dir.path)], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+
+    for (id, path) in rows {
+        let p = std::path::Path::new(&path);
+        if !TRACK_EXTENSIONS.contains(&ext_of(p).as_str()) {
+            continue;
+        }
+        let superseded = p.parent().is_some_and(|dir| {
+            std::fs::read_dir(dir)
+                .map(|rd| {
+                    rd.filter_map(|e| e.ok())
+                        .any(|e| PLAYLIST_EXTENSIONS.contains(&ext_of(&e.path()).as_str()))
+                })
+                .unwrap_or(false)
+        });
+        if superseded {
+            games::delete(conn, &id)?;
+            report.skipped += 1;
+        }
+    }
+    Ok(())
 }
 
 fn find_installation_by_source(
@@ -248,6 +317,11 @@ pub fn sync_rom_directory(
             .push(format!("directory not found: {}", dir.path));
         return Ok(());
     }
+
+    // Remove games wrongly created from raw CD tracks in earlier scans (a
+    // `.bin`/`.img`/`.wav` superseded by a `.cue` in the same folder).
+    db.with(|c| purge_superseded_track_games(c, dir, report))?;
+
     let files = collect_rom_files(dir, &platform, cancel)?;
     let total = files.len() as u32;
 
@@ -1425,5 +1499,112 @@ mod tests {
         let mut report = ScanReport::default();
         sync_rom_directory(&db, &dir, &cancel, &sink(), &mut report).unwrap();
         assert_eq!(report.added, 1);
+    }
+
+    fn psx_dir(db: &Db, path: &str) -> RomDirectory {
+        db.with(|c| {
+            c.execute(
+                "INSERT OR IGNORE INTO platforms (id, name, short_name, extensions) VALUES ('psx','PlayStation','PS1','[\"cue\",\"bin\",\"chd\"]')",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        RomDirectory {
+            id: "psx".into(),
+            path: path.into(),
+            platform_id: "psx".into(),
+            emulator_id: None,
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn multi_track_cd_image_imports_as_one_game() {
+        // Real-world layout: one cue sheet plus separately-named data/audio
+        // tracks. Only the cue should become a game.
+        let tmp = tempfile::tempdir().unwrap();
+        let g = tmp.path().join("Armorines - Project S.W.A.R.M. (USA)");
+        std::fs::create_dir_all(&g).unwrap();
+        std::fs::write(g.join("Armorines - Project S.W.A.R.M. (USA).cue"), b"cue").unwrap();
+        std::fs::write(
+            g.join("Armorines - Project S.W.A.R.M. (USA) (Track 1).bin"),
+            b"t1",
+        )
+        .unwrap();
+        std::fs::write(
+            g.join("Armorines - Project S.W.A.R.M. (USA) (Track 2).bin"),
+            b"t2",
+        )
+        .unwrap();
+
+        let db = Db::open_in_memory().unwrap();
+        let dir = psx_dir(&db, tmp.path().to_str().unwrap());
+        let cancel = AtomicBool::new(false);
+        let mut report = ScanReport::default();
+        sync_rom_directory(&db, &dir, &cancel, &sink(), &mut report).unwrap();
+
+        assert_eq!(report.added, 1);
+        let (count, path): (i64, String) = db
+            .with(|c| {
+                Ok(c.query_row(
+                    "SELECT (SELECT COUNT(*) FROM games), i.path FROM installations i",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(count, 1);
+        assert!(
+            path.ends_with(".cue"),
+            "the cue should be the installation, got {path}"
+        );
+    }
+
+    #[test]
+    fn purges_existing_track_duplicate_games() {
+        let tmp = tempfile::tempdir().unwrap();
+        let g = tmp.path().join("Castlevania - Symphony of the Night (USA)");
+        std::fs::create_dir_all(&g).unwrap();
+        let cue = g.join("Castlevania - Symphony of the Night (USA).cue");
+        let t1 = g.join("Castlevania - Symphony of the Night (USA) (Track 1).bin");
+        let t2 = g.join("Castlevania - Symphony of the Night (USA) (Track 2).bin");
+        std::fs::write(&cue, b"cue").unwrap();
+        std::fs::write(&t1, b"t1").unwrap();
+        std::fs::write(&t2, b"t2").unwrap();
+
+        let db = Db::open_in_memory().unwrap();
+        let dir = psx_dir(&db, tmp.path().to_str().unwrap());
+
+        // Simulate the old scanner: a game per file, tracks included.
+        db.with(|c| {
+            for (i, p) in [&cue, &t1, &t2].iter().enumerate() {
+                let game = games::insert(c, &games::NewGame { title: &format!("Castlevania {i}"), platform_id: "psx", release_date: None, region: None })?;
+                c.execute(
+                    "INSERT INTO installations (id, game_id, source_type, source_id, path, installed)
+                     VALUES (?1, ?2, 'rom', ?3, ?3, 1)",
+                    params![repo::new_id(), game.id, p.to_str().unwrap()],
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
+
+        let cancel = AtomicBool::new(false);
+        let mut report = ScanReport::default();
+        sync_rom_directory(&db, &dir, &cancel, &sink(), &mut report).unwrap();
+
+        // The two track games are purged; only the cue game remains.
+        let count: i64 = db
+            .with(|c| Ok(c.query_row("SELECT COUNT(*) FROM games", [], |r| r.get(0))?))
+            .unwrap();
+        assert_eq!(count, 1);
+        let path: String = db
+            .with(|c| Ok(c.query_row("SELECT path FROM installations", [], |r| r.get(0))?))
+            .unwrap();
+        assert!(
+            path.ends_with(".cue"),
+            "only the cue should remain, got {path}"
+        );
     }
 }

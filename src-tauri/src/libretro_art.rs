@@ -75,6 +75,10 @@ fn encode_segment(segment: &str) -> String {
 const REGION_SUFFIXES: &[&str] = &["(USA)", "(Europe)", "(Japan)", "(World)", "(USA, Europe)"];
 
 /// Candidate display names to try for a game, most specific first.
+///
+/// Covers Redump/No-Intro naming including multi-disc sets (`… (Disc 1)`) and
+/// the common European language tag (`(Europe) (En,Fr,De,Es)`), so TOSEC-style
+/// dumps (whose raw stems never match) still resolve via the cleaned title.
 pub fn name_candidates(title: &str, rom_path: Option<&str>) -> Vec<String> {
     let mut names: Vec<String> = Vec::new();
     let mut push = |n: String| {
@@ -92,10 +96,16 @@ pub fn name_candidates(title: &str, rom_path: Option<&str>) -> Vec<String> {
             push(cleaned);
         }
     }
-    // The cleaned title, then the title qualified by each common region.
+    // The cleaned title, then the title qualified by each common region —
+    // with multi-disc and Europe-language variants per region.
     push(title.to_string());
     for suffix in REGION_SUFFIXES {
         push(format!("{title} {suffix}"));
+        push(format!("{title} {suffix} (Disc 1)"));
+        if *suffix == "(Europe)" {
+            push(format!("{title} (Europe) (En,Fr,De,Es)"));
+            push(format!("{title} (Europe) (En,Fr,De,Es) (Disc 1)"));
+        }
     }
     names
 }

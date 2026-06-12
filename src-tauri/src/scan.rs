@@ -74,10 +74,37 @@ impl ProgressSink<'_> {
     }
 }
 
+/// A TOSEC-style version token: `v1.003`, `v2`, `V1.1.2` — a `v` followed by
+/// digits/dots. Roman numerals and bare letters are untouched.
+fn is_version_token(token: &str) -> bool {
+    let rest = match token.strip_prefix('v').or_else(|| token.strip_prefix('V')) {
+        Some(r) => r,
+        None => return false,
+    };
+    !rest.is_empty()
+        && rest.chars().all(|c| c.is_ascii_digit() || c == '.')
+        && rest.chars().any(|c| c.is_ascii_digit())
+}
+
+fn strip_version_tokens(title: &str) -> String {
+    title
+        .split_whitespace()
+        .filter(|t| !is_version_token(t))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Clean a ROM file name into a human title. Strips the extension, bracketed
-/// tags like `(USA)` / `[!]`, and normalizes separators. Returns the title
-/// and a detected region when present.
+/// tags like `(USA)` / `[!]`, version tokens like `v1.003`, and normalizes
+/// separators. Returns the title and a detected region when present.
 pub fn title_from_filename(file_name: &str) -> (String, Option<String>) {
+    let (raw, region) = title_from_filename_unversioned(file_name);
+    (strip_version_tokens(&raw), region)
+}
+
+/// Like [`title_from_filename`] but keeps version tokens — the form older
+/// scans produced, used to recognize stale auto-generated titles.
+fn title_from_filename_unversioned(file_name: &str) -> (String, Option<String>) {
     let stem = Path::new(file_name)
         .file_stem()
         .and_then(|s| s.to_str())
@@ -219,6 +246,114 @@ fn collect_rom_files(
     Ok(files)
 }
 
+/// Disc index from a multi-disc dump name: `(Disc 1 of 4)`, `(Disk 2)`, `(CD 3)`.
+fn disc_number(file_name: &str) -> Option<u32> {
+    let lower = file_name.to_lowercase();
+    let bytes = lower.as_bytes();
+    for marker in ["disc ", "disk ", "cd "] {
+        let mut start = 0;
+        while let Some(pos) = lower[start..].find(marker) {
+            let abs = start + pos;
+            let preceded = abs == 0 || matches!(bytes[abs - 1], b'(' | b'[' | b' ');
+            let digits: String = lower[abs + marker.len()..]
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            if preceded && !digits.is_empty() {
+                return digits.parse().ok();
+            }
+            start = abs + marker.len();
+        }
+    }
+    None
+}
+
+/// Collapse multi-disc dumps: files sharing a cleaned title where at least one
+/// carries a disc marker become one group booting the lowest-numbered disc.
+/// Returns the reduced file list plus, per collapsed group, every member path
+/// (primary first) so existing per-disc games can be reconciled.
+fn collapse_disc_groups(files: Vec<RomFile>) -> (Vec<RomFile>, Vec<Vec<String>>) {
+    let mut by_title: HashMap<String, Vec<(Option<u32>, RomFile)>> = HashMap::new();
+    let mut order: Vec<String> = Vec::new();
+    for file in files {
+        let (title, _) = title_from_filename(&file.file_name);
+        let disc = disc_number(&file.file_name);
+        let key = title.to_lowercase();
+        if !by_title.contains_key(&key) {
+            order.push(key.clone());
+        }
+        by_title.entry(key).or_default().push((disc, file));
+    }
+
+    let mut kept = Vec::new();
+    let mut groups = Vec::new();
+    for key in order {
+        let mut members = by_title.remove(&key).unwrap();
+        let is_multi_disc = members.len() > 1 && members.iter().all(|(d, _)| d.is_some());
+        if !is_multi_disc {
+            kept.extend(members.into_iter().map(|(_, f)| f));
+            continue;
+        }
+        members.sort_by_key(|(d, _)| d.unwrap_or(u32::MAX));
+        let paths: Vec<String> = members.iter().map(|(_, f)| f.path.clone()).collect();
+        kept.push(members.remove(0).1);
+        groups.push(paths);
+    }
+    (kept, groups)
+}
+
+/// Merge any existing games for a multi-disc group into one entry whose
+/// installation boots the primary (first) disc. Favorited/earliest game wins.
+fn reconcile_disc_group(
+    conn: &Connection,
+    paths: &[String],
+    emulator_id: Option<&str>,
+    report: &mut ScanReport,
+) -> Result<()> {
+    let primary = &paths[0];
+    let mut game_ids: Vec<String> = Vec::new();
+    for path in paths {
+        if let Some(gid) = game_id_for_source(conn, path)? {
+            if !game_ids.contains(&gid) {
+                game_ids.push(gid);
+            }
+        }
+    }
+    if game_ids.is_empty() {
+        return Ok(()); // nothing imported yet; the scan loop creates it fresh
+    }
+    game_ids.sort_by_key(|id| game_sort_key(conn, id).unwrap_or((true, i64::MAX)));
+    let keep = game_ids[0].clone();
+    let mut merged = false;
+    for gid in &game_ids[1..] {
+        games::delete(conn, gid)?;
+        merged = true;
+    }
+
+    let already_canonical: bool = conn
+        .query_row(
+            "SELECT COUNT(*) = 1 AND MAX(CASE WHEN source_id = ?2 AND installed = 1 THEN 1 ELSE 0 END) = 1
+             FROM installations WHERE game_id = ?1",
+            params![keep, primary],
+            |r| r.get::<_, bool>(0),
+        )
+        .unwrap_or(false);
+    if already_canonical && !merged {
+        return Ok(());
+    }
+    let size = std::fs::metadata(primary)
+        .map(|m| m.len() as i64)
+        .unwrap_or(0);
+    conn.execute("DELETE FROM installations WHERE game_id = ?1", [&keep])?;
+    conn.execute(
+        "INSERT INTO installations (id, game_id, source_type, source_id, path, emulator_id, installed, file_size)
+         VALUES (?1, ?2, 'rom', ?3, ?3, ?4, 1, ?5)",
+        params![repo::new_id(), keep, primary, emulator_id, size],
+    )?;
+    report.updated += 1;
+    Ok(())
+}
+
 /// Delete games whose ROM installation is a raw CD track (`.bin`/`.img`/…)
 /// that a `.cue`/`.gdi`/`.ccd` in the same folder supersedes — leftovers from
 /// before track files were skipped.
@@ -322,7 +457,16 @@ pub fn sync_rom_directory(
     // `.bin`/`.img`/`.wav` superseded by a `.cue` in the same folder).
     db.with(|c| purge_superseded_track_games(c, dir, report))?;
 
-    let files = collect_rom_files(dir, &platform, cancel)?;
+    // Multi-disc dumps (Shenmue Disc 1–4…) collapse to one game per title,
+    // booting disc 1; existing per-disc entries are merged.
+    let (files, disc_groups) = collapse_disc_groups(collect_rom_files(dir, &platform, cancel)?);
+    let group_emulator = dir
+        .emulator_id
+        .clone()
+        .or_else(|| platform.default_emulator_id.clone());
+    for group in &disc_groups {
+        db.with(|c| reconcile_disc_group(c, group, group_emulator.as_deref(), report))?;
+    }
     let total = files.len() as u32;
 
     // Pass 1: mark installations under this directory whose file disappeared.
@@ -356,12 +500,31 @@ pub fn sync_rom_directory(
         progress.report("importing", index as u32 + 1, total, &file.file_name);
         db.with(|c| {
             if let Some(install_id) = find_installation_by_source(c, "rom", &file.path)? {
-                // Known file: ensure it is flagged installed; never touch metadata.
+                // Known file: ensure it is flagged installed. Metadata stays
+                // untouched, except stale auto-generated titles (the exact
+                // string an older scan derived from this filename) are healed
+                // to the current, cleaner derivation.
+                let game_id: String = c.query_row(
+                    "SELECT game_id FROM installations WHERE id = ?1",
+                    [&install_id],
+                    |r| r.get(0),
+                )?;
+                let current: String =
+                    c.query_row("SELECT title FROM games WHERE id = ?1", [&game_id], |r| {
+                        r.get(0)
+                    })?;
+                let (clean, _) = title_from_filename(&file.file_name);
+                let (stale, _) = title_from_filename_unversioned(&file.file_name);
+                let healed = if current == stale && current != clean {
+                    set_title_if_unlocked(c, &game_id, &clean)?
+                } else {
+                    false
+                };
                 let changed = c.execute(
                     "UPDATE installations SET installed = 1, file_size = ?1 WHERE id = ?2 AND installed = 0",
                     params![file.size, install_id],
                 )?;
-                if changed > 0 {
+                if changed > 0 || healed {
                     report.updated += 1;
                 } else {
                     report.skipped += 1;
@@ -1370,6 +1533,147 @@ mod tests {
 
         let (title, _) = title_from_filename("Banjo-Kazooie.z64");
         assert_eq!(title, "Banjo-Kazooie");
+    }
+
+    #[test]
+    fn title_cleaning_strips_tosec_version_tokens() {
+        let (title, region) =
+            title_from_filename("Shenmue v1.003 (2000)(Sega)(NTSC)(US)(Disc 1 of 4)[!].gdi");
+        assert_eq!(title, "Shenmue");
+        assert_eq!(region.as_deref(), Some("USA"));
+
+        let (title, _) = title_from_filename("Crazy Taxi 2 v1.004 (2001)(Sega)(NTSC)(US)[!].gdi");
+        assert_eq!(title, "Crazy Taxi 2");
+
+        // Roman numerals and bare letters are not version tokens.
+        let (title, _) = title_from_filename("Grand Theft Auto V.exe");
+        assert_eq!(title, "Grand Theft Auto V");
+    }
+
+    #[test]
+    fn disc_numbers_are_detected() {
+        assert_eq!(
+            disc_number("Shenmue v1.003 (US)(Disc 1 of 4)[!].gdi"),
+            Some(1)
+        );
+        assert_eq!(disc_number("Final Fantasy VII (USA) (Disc 3).cue"), Some(3));
+        assert_eq!(disc_number("Riven (USA) (CD 2).cue"), Some(2));
+        assert_eq!(disc_number("Crazy Taxi 2 v1.004 (US)[!].gdi"), None);
+    }
+
+    #[test]
+    fn multi_disc_dump_collapses_to_one_game_booting_disc_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        for d in 1..=4 {
+            let dir = tmp.path().join(format!("Shenmue (Disc {d})"));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join(format!(
+                    "Shenmue v1.003 (2000)(Sega)(NTSC)(US)(Disc {d} of 4)[!].gdi"
+                )),
+                b"gdi",
+            )
+            .unwrap();
+        }
+
+        let db = Db::open_in_memory().unwrap();
+        db.with(|c| {
+            c.execute(
+                "INSERT INTO platforms (id, name, short_name, extensions) VALUES ('dreamcast','Sega Dreamcast','DC','[\"gdi\",\"cdi\",\"chd\"]')",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let dir = RomDirectory {
+            id: "dc".into(),
+            path: tmp.path().to_string_lossy().to_string(),
+            platform_id: "dreamcast".into(),
+            emulator_id: None,
+            enabled: true,
+        };
+        let cancel = AtomicBool::new(false);
+        let mut report = ScanReport::default();
+        sync_rom_directory(&db, &dir, &cancel, &sink(), &mut report).unwrap();
+
+        let (count, title, path): (i64, String, String) = db
+            .with(|c| {
+                Ok(c.query_row(
+                    "SELECT (SELECT COUNT(*) FROM games), g.title, i.path
+                     FROM games g JOIN installations i ON i.game_id = g.id",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(count, 1, "4 discs should collapse to one game");
+        assert_eq!(title, "Shenmue");
+        assert!(
+            path.contains("Disc 1 of 4"),
+            "should boot disc 1, got {path}"
+        );
+
+        // Rescan is idempotent.
+        let mut r2 = ScanReport::default();
+        sync_rom_directory(&db, &dir, &cancel, &sink(), &mut r2).unwrap();
+        assert_eq!(r2.added, 0);
+        let count: i64 = db
+            .with(|c| Ok(c.query_row("SELECT COUNT(*) FROM games", [], |r| r.get(0))?))
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn existing_per_disc_duplicates_merge_and_title_heals() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut paths = Vec::new();
+        for d in 1..=2 {
+            let dir = tmp.path().join(format!("Disc {d}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let p = dir.join(format!("Shenmue v1.003 (NTSC)(US)(Disc {d} of 2)[!].gdi"));
+            std::fs::write(&p, b"gdi").unwrap();
+            paths.push(p);
+        }
+
+        let db = Db::open_in_memory().unwrap();
+        db.with(|c| {
+            c.execute(
+                "INSERT INTO platforms (id, name, short_name, extensions) VALUES ('dreamcast','Sega Dreamcast','DC','[\"gdi\"]')",
+                [],
+            )?;
+            // Old scanner output: one game per disc, version token in title.
+            for p in &paths {
+                let g = games::insert(c, &games::NewGame { title: "Shenmue v1.003", platform_id: "dreamcast", release_date: None, region: None })?;
+                c.execute(
+                    "INSERT INTO installations (id, game_id, source_type, source_id, path, installed)
+                     VALUES (?1, ?2, 'rom', ?3, ?3, 1)",
+                    params![repo::new_id(), g.id, p.to_str().unwrap()],
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
+
+        let dir = RomDirectory {
+            id: "dc".into(),
+            path: tmp.path().to_string_lossy().to_string(),
+            platform_id: "dreamcast".into(),
+            emulator_id: None,
+            enabled: true,
+        };
+        let cancel = AtomicBool::new(false);
+        let mut report = ScanReport::default();
+        sync_rom_directory(&db, &dir, &cancel, &sink(), &mut report).unwrap();
+
+        let (count, title): (i64, String) = db
+            .with(|c| {
+                Ok(c.query_row("SELECT COUNT(*), title FROM games", [], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })?)
+            })
+            .unwrap();
+        assert_eq!(count, 1, "per-disc duplicates should merge");
+        assert_eq!(title, "Shenmue", "stale versioned title should heal");
     }
 
     #[test]

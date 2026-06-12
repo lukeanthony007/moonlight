@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import type { LibraryEntry, Platform } from "@/lib/types";
 import { GameCard } from "./GameCard";
@@ -36,19 +36,18 @@ export function GameGrid({
   const platformById = useMemo(() => new Map(platforms.map((p) => [p.id, p])), [platforms]);
 
   // Track measured width of the scroll container for column math.
-  const widthRef = useRef(1200);
+  const [width, setWidth] = useState(1200);
   useEffect(() => {
     const el = parentRef.current;
     if (!el) return;
     const observer = new ResizeObserver((entries) => {
-      widthRef.current = entries[0]?.contentRect.width ?? 1200;
+      const next = entries[0]?.contentRect.width;
+      if (next) setWidth(next);
     });
     observer.observe(el);
-    widthRef.current = el.clientWidth;
+    setWidth(el.clientWidth || 1200);
     return () => observer.disconnect();
-  });
-
-  const width = widthRef.current;
+  }, []);
   const columns =
     viewMode === "list" ? 1 : Math.max(2, Math.floor((width + CARD_GAP) / (CARD_MIN_WIDTH + CARD_GAP)));
   const cardWidth = viewMode === "list" ? width : (width - CARD_GAP * (columns - 1)) / columns;

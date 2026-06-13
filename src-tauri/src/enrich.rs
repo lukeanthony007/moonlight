@@ -37,23 +37,28 @@ struct Target {
     release_date: Option<String>,
     platform_id: String,
     rom_path: Option<String>,
+    /// Steam appid (the steam installation's source id), when applicable.
+    steam_appid: Option<String>,
 }
 
 fn missing_artwork_targets(db: &Db, platform_filter: Option<&str>) -> Result<Vec<Target>> {
     db.with(|c| {
-        // Target games missing box art, plus Switch games that have art but no
-        // official metadata yet (so their names get corrected once).
+        // Target games missing box art, plus games on platforms with a keyless
+        // metadata source (Switch, Steam) that haven't been enriched yet — so
+        // their names, dates and details get filled in once.
         let mut stmt = c.prepare(
             "SELECT g.id, g.title, g.release_date, g.platform_id,
                     (SELECT i.path FROM installations i
-                     WHERE i.game_id = g.id AND i.source_type = 'rom' LIMIT 1) AS rom_path
+                     WHERE i.game_id = g.id AND i.source_type = 'rom' LIMIT 1) AS rom_path,
+                    (SELECT i.source_id FROM installations i
+                     WHERE i.game_id = g.id AND i.source_type = 'steam' LIMIT 1) AS steam_appid
              FROM games g
-             WHERE g.platform_id != 'steam'
-               AND ( NOT EXISTS (
+             WHERE ( g.platform_id != 'steam'
+                     AND NOT EXISTS (
                        SELECT 1 FROM artwork a
                        WHERE a.game_id = g.id AND a.kind = 'boxart' AND a.local_path IS NOT NULL
-                     )
-                     OR (g.platform_id = 'switch' AND g.provider_metadata IS NULL) )
+                     ) )
+                OR ( g.platform_id IN ('switch', 'steam') AND g.provider_metadata IS NULL )
              ORDER BY g.sort_title",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -63,6 +68,7 @@ fn missing_artwork_targets(db: &Db, platform_filter: Option<&str>) -> Result<Vec
                 release_date: r.get(2)?,
                 platform_id: r.get(3)?,
                 rom_path: r.get(4)?,
+                steam_appid: r.get(5)?,
             })
         })?;
         let all = rows.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -87,6 +93,7 @@ pub fn has_any_source(db: &Db, platform_filter: Option<&str>) -> bool {
             t.iter().any(|g| {
                 libretro_art::system_for(&g.platform_id).is_some()
                     || switch_art::can_match(g.rom_path.as_deref())
+                    || g.steam_appid.is_some()
             })
         })
         .unwrap_or(false)
@@ -239,6 +246,28 @@ pub fn run_enrich(
                             )
                         });
                     }
+                }
+            }
+
+            // 0b. Steam: pull release date / developer / publisher / genres /
+            //     description from the keyless store API (enables date sorting).
+            if let Some(appid) = &target.steam_appid {
+                if let Some(meta) = crate::steam_store::fetch_metadata(appid) {
+                    let _ = db.with(|c| {
+                        games::merge_provider_metadata(
+                            c,
+                            &target.id,
+                            &games::ProviderMetadata {
+                                provider: "steam".into(),
+                                title: meta.name,
+                                description: meta.description,
+                                release_date: meta.release_date,
+                                developer: meta.developer,
+                                publisher: meta.publisher,
+                                genres: meta.genres,
+                            },
+                        )
+                    });
                 }
             }
 

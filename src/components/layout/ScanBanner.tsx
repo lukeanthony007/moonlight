@@ -33,7 +33,7 @@ export function ScanBanner() {
             <Loader2 className="size-5 shrink-0 animate-spin text-accent" />
             <div className="min-w-0 w-72">
               <div className="text-sm font-medium">
-                {isArtwork ? "Fetching artwork" : "Scanning library"}
+                {isArtwork ? "Matching metadata & artwork" : "Scanning library"}
                 {progress?.total ? ` · ${progress.current}/${progress.total}` : "…"}
               </div>
               <div className="truncate text-xs text-ink-dim">{progress?.message ?? "Starting…"}</div>
@@ -70,14 +70,14 @@ export function ScanBanner() {
               <div className="text-sm font-medium">
                 {lastReport.cancelled
                   ? isArtwork
-                    ? "Artwork fetch cancelled"
+                    ? "Matching cancelled"
                     : "Scan cancelled"
                   : isArtwork
-                    ? "Artwork fetch complete"
+                    ? "Metadata & artwork matched"
                     : "Scan complete"}
                 <span className="ml-2 text-xs font-normal text-ink-dim">
                   {isArtwork
-                    ? `${lastReport.updated} matched · ${lastReport.skipped} without artwork`
+                    ? `${lastReport.updated} matched · ${lastReport.skipped} unmatched`
                     : `${lastReport.added} added · ${lastReport.reconnected} reconnected · ${lastReport.missing} missing`}
                 </span>
               </div>

@@ -275,10 +275,11 @@ pub fn run_enrich(
                 }
             }
 
-            // 0c. Console ROMs: match against the local LaunchBox Games DB for
-            //     description / developer / publisher / genres / release date.
-            //     Steam and Switch already have dedicated, better sources.
-            if target.platform_id != "steam" && target.platform_id != "switch" {
+            // 0c. Console ROMs (incl. Switch): match against the local LaunchBox
+            //     Games DB for description / developer / publisher / genres /
+            //     release date. Merges respect locks, so the Switch eShop name
+            //     and Steam store fields fetched above are preserved.
+            if target.platform_id != "steam" {
                 if let Ok(Some(meta)) =
                     db.with(|c| crate::launchbox::lookup(c, &target.platform_id, &target.title))
                 {

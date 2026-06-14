@@ -99,7 +99,9 @@ fn strip_version_tokens(title: &str) -> String {
 /// separators. Returns the title and a detected region when present.
 pub fn title_from_filename(file_name: &str) -> (String, Option<String>) {
     let (raw, region) = title_from_filename_unversioned(file_name);
-    (strip_version_tokens(&raw), region)
+    // Strip the ".nkit" compression marker left in GameCube/Wii dump names.
+    let raw = raw.replace(".nkit", "").replace(".NKIT", "");
+    (normalize_ws(&strip_version_tokens(&raw)), region)
 }
 
 /// Extract a release date from a ROM filename's parenthesised tags. Matches a
@@ -180,13 +182,30 @@ fn title_from_filename_unversioned(file_name: &str) -> (String, Option<String>) 
         }
     }
     let title = title.replace('_', " ");
-    let title = title.split_whitespace().collect::<Vec<_>>().join(" ");
-    // "Legend of Zelda, The" -> "The Legend of Zelda"
-    let title = match title.rsplit_once(", The") {
-        Some((head, rest)) if rest.trim().is_empty() => format!("The {head}"),
-        _ => title,
-    };
-    (title.trim().to_string(), region)
+    let title = normalize_ws(&title);
+    (move_leading_article(&title), region)
+}
+
+/// Collapse runs of whitespace and trim.
+fn normalize_ws(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Move a trailing-comma article to the front, as No-Intro/Redump encode it:
+/// `Legend of Zelda, The - The Wind Waker` → `The Legend of Zelda - The Wind
+/// Waker`, `Bug's Life, A` → `A Bug's Life`. The article must be a standalone
+/// token so `Foo, Affair` is left alone.
+fn move_leading_article(title: &str) -> String {
+    for (needle, word) in [(", The", "The"), (", An", "An"), (", A", "A")] {
+        if let Some(idx) = title.find(needle) {
+            let after = &title[idx + needle.len()..];
+            if after.is_empty() || after.starts_with(' ') {
+                let head = &title[..idx];
+                return normalize_ws(&format!("{word} {head}{after}"));
+            }
+        }
+    }
+    title.to_string()
 }
 
 fn normalize_region(tag: &str) -> String {
@@ -548,17 +567,11 @@ pub fn sync_rom_directory(
                     [&install_id],
                     |r| r.get(0),
                 )?;
-                let current: String =
-                    c.query_row("SELECT title FROM games WHERE id = ?1", [&game_id], |r| {
-                        r.get(0)
-                    })?;
+                // Heal the auto-generated title to the current derivation
+                // (e.g. dropping a ".nkit" marker, fixing ", The"). User-locked
+                // titles are left untouched by set_title_if_unlocked.
                 let (clean, _) = title_from_filename(&file.file_name);
-                let (stale, _) = title_from_filename_unversioned(&file.file_name);
-                let healed = if current == stale && current != clean {
-                    set_title_if_unlocked(c, &game_id, &clean)?
-                } else {
-                    false
-                };
+                let healed = set_title_if_unlocked(c, &game_id, &clean)?;
                 // Backfill a release date from the filename when the game has
                 // none yet (older scans never extracted it).
                 let dated = if let Some(date) = date_from_filename(&file.file_name) {
@@ -1584,6 +1597,27 @@ mod tests {
 
         let (title, _) = title_from_filename("Banjo-Kazooie.z64");
         assert_eq!(title, "Banjo-Kazooie");
+    }
+
+    #[test]
+    fn title_cleaning_strips_nkit_and_moves_subtitle_articles() {
+        // ".nkit" compression marker removed.
+        let (title, _) = title_from_filename("GoldenEye - Rogue Agent (USA) (Disc 1).nkit.iso");
+        assert_eq!(title, "GoldenEye - Rogue Agent");
+        let (title, _) = title_from_filename("Amazing Island (USA).nkit.iso");
+        assert_eq!(title, "Amazing Island");
+
+        // ", The" before a subtitle moves to the front.
+        let (title, _) = title_from_filename("Legend of Zelda, The - The Wind Waker (USA).iso");
+        assert_eq!(title, "The Legend of Zelda - The Wind Waker");
+        let (title, _) = title_from_filename("Simpsons, The - Hit & Run (USA).iso");
+        assert_eq!(title, "The Simpsons - Hit & Run");
+
+        // ", A" / ", An" as standalone articles; partial words untouched.
+        let (title, _) = title_from_filename("Bug's Life, A (USA).iso");
+        assert_eq!(title, "A Bug's Life");
+        let (title, _) = title_from_filename("Bug's Affair, Antics (USA).iso");
+        assert_eq!(title, "Bug's Affair, Antics");
     }
 
     #[test]

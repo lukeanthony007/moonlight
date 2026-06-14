@@ -43,9 +43,12 @@ struct Target {
 
 fn missing_artwork_targets(db: &Db, platform_filter: Option<&str>) -> Result<Vec<Target>> {
     db.with(|c| {
+        // When the LaunchBox database is downloaded, every ROM game without
+        // metadata becomes a metadata target too (not just Switch/Steam).
+        let has_launchbox = crate::launchbox::cached_count(c).unwrap_or(0) > 0;
         // Target games missing box art, plus games on platforms with a keyless
-        // metadata source (Switch, Steam) that haven't been enriched yet — so
-        // their names, dates and details get filled in once.
+        // metadata source that haven't been enriched yet — so their names,
+        // dates and details get filled in once.
         let mut stmt = c.prepare(
             "SELECT g.id, g.title, g.release_date, g.platform_id,
                     (SELECT i.path FROM installations i
@@ -58,10 +61,11 @@ fn missing_artwork_targets(db: &Db, platform_filter: Option<&str>) -> Result<Vec
                        SELECT 1 FROM artwork a
                        WHERE a.game_id = g.id AND a.kind = 'boxart' AND a.local_path IS NOT NULL
                      ) )
-                OR ( g.platform_id IN ('switch', 'steam') AND g.provider_metadata IS NULL )
+                OR ( g.provider_metadata IS NULL
+                     AND ( g.platform_id IN ('switch', 'steam') OR ?1 = 1 ) )
              ORDER BY g.sort_title",
         )?;
-        let rows = stmt.query_map([], |r| {
+        let rows = stmt.query_map([has_launchbox], |r| {
             Ok(Target {
                 id: r.get(0)?,
                 title: r.get(1)?,
@@ -261,6 +265,31 @@ pub fn run_enrich(
                                 provider: "steam".into(),
                                 title: meta.name,
                                 description: meta.description,
+                                release_date: meta.release_date,
+                                developer: meta.developer,
+                                publisher: meta.publisher,
+                                genres: meta.genres,
+                            },
+                        )
+                    });
+                }
+            }
+
+            // 0c. Console ROMs: match against the local LaunchBox Games DB for
+            //     description / developer / publisher / genres / release date.
+            //     Steam and Switch already have dedicated, better sources.
+            if target.platform_id != "steam" && target.platform_id != "switch" {
+                if let Ok(Some(meta)) =
+                    db.with(|c| crate::launchbox::lookup(c, &target.platform_id, &target.title))
+                {
+                    let _ = db.with(|c| {
+                        games::merge_provider_metadata(
+                            c,
+                            &target.id,
+                            &games::ProviderMetadata {
+                                provider: "launchbox".into(),
+                                title: None, // keep the title we derived from the file
+                                description: meta.overview,
                                 release_date: meta.release_date,
                                 developer: meta.developer,
                                 publisher: meta.publisher,

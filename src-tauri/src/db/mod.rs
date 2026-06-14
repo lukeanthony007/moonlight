@@ -12,7 +12,13 @@ use std::sync::Mutex;
 
 /// Ordered list of migrations. Append new migrations at the end; never edit
 /// an existing one after release.
-const MIGRATIONS: &[(&str, &str)] = &[("001_initial", include_str!("migrations/001_initial.sql"))];
+const MIGRATIONS: &[(&str, &str)] = &[
+    ("001_initial", include_str!("migrations/001_initial.sql")),
+    (
+        "002_launchbox",
+        include_str!("migrations/002_launchbox.sql"),
+    ),
+];
 
 pub struct Db {
     conn: Mutex<Connection>,

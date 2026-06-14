@@ -1,16 +1,87 @@
 use super::AppState;
 use crate::artwork_store;
 use crate::db::repo::{artwork, games};
-use crate::domain::{Artwork, Game};
+use crate::domain::{Artwork, Game, ScanProgress, ScanReport};
 use crate::error::Result;
 use crate::metadata::{
     self, cached_or_fetch, ArtworkCandidate, ProviderMatch, ProviderStatus, SearchQuery,
 };
-use tauri::State;
+use crate::scan::ScanRegistry;
+use tauri::{Emitter, Manager, State};
 
 #[tauri::command]
 pub async fn get_provider_statuses(state: State<'_, AppState>) -> Result<Vec<ProviderStatus>> {
     metadata::provider_statuses(&state.db)
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LaunchboxStatus {
+    pub count: i64,
+}
+
+#[tauri::command]
+pub async fn launchbox_status(state: State<'_, AppState>) -> Result<LaunchboxStatus> {
+    let count = state.db.with(crate::launchbox::cached_count)?;
+    Ok(LaunchboxStatus { count })
+}
+
+/// Download and import the LaunchBox Games Database in the background. Progress
+/// and completion are reported on the shared `scan-progress` / `scan-complete`
+/// channels with source `launchbox`, so the existing status banner shows it.
+#[tauri::command]
+pub async fn download_launchbox_db(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<String> {
+    let scan_id = uuid::Uuid::new_v4().to_string();
+    let cancel = app.state::<ScanRegistry>().begin(&scan_id);
+
+    let db = state.db.clone();
+    let cache_dir = state.paths.data_dir.join("metadata");
+    let scan_id_out = scan_id.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let started = std::time::Instant::now();
+        let progress_id = scan_id.clone();
+        let progress_app = app.clone();
+        let result =
+            crate::launchbox::download_and_import(&db, &cache_dir, cancel, |imported, seen| {
+                let _ = progress_app.emit(
+                    "scan-progress",
+                    ScanProgress {
+                        scan_id: progress_id.clone(),
+                        source: "launchbox".into(),
+                        phase: if seen == 0 {
+                            "downloading".into()
+                        } else {
+                            "importing".into()
+                        },
+                        current: imported as u32,
+                        total: seen as u32,
+                        message: if seen == 0 {
+                            "Downloading metadata database…".into()
+                        } else {
+                            format!("{imported} games imported")
+                        },
+                    },
+                );
+            });
+
+        let mut report = ScanReport {
+            scan_id: scan_id.clone(),
+            source: "launchbox".into(),
+            ..Default::default()
+        };
+        match result {
+            Ok(imported) => report.updated = imported as u32,
+            Err(crate::error::AppError::Cancelled) => report.cancelled = true,
+            Err(e) => report.errors.push(e.to_string()),
+        }
+        report.duration_ms = started.elapsed().as_millis() as u64;
+        app.state::<ScanRegistry>().finish(&scan_id, report.clone());
+        let _ = app.emit("scan-complete", &report);
+    });
+    Ok(scan_id_out)
 }
 
 #[tauri::command]

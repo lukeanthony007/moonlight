@@ -438,13 +438,21 @@ function ProvidersSection() {
   const activeScanId = useScanStore((s) => s.activeScanId);
   const [key, setKey] = useState("");
   const [enrichError, setEnrichError] = useState<string | null>(null);
+  const [lbCount, setLbCount] = useState<number | null>(null);
 
-  const anyConfigured = providers.some((p) => p.configured);
+  const refreshLbStatus = () =>
+    void api.launchboxStatus().then((s) => setLbCount(s.count)).catch(() => setLbCount(0));
 
   useEffect(() => {
     setKey(settings.get("providers.steamgriddb.apiKey", ""));
+    refreshLbStatus();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [settings.loaded]);
+
+  // Refresh the indexed-games count when a download finishes.
+  useEffect(() => {
+    if (activeScanId === null) refreshLbStatus();
+  }, [activeScanId]);
 
   async function fetchMissingArtwork() {
     setEnrichError(null);
@@ -455,37 +463,62 @@ function ProvidersSection() {
     }
   }
 
+  async function downloadLaunchbox() {
+    setEnrichError(null);
+    try {
+      await api.downloadLaunchboxDb();
+    } catch (e) {
+      setEnrichError(api.errorMessage(e));
+    }
+  }
+
   return (
     <div>
       <SectionTitle
         title="Metadata Providers"
-        description="Optional services for metadata and artwork. Moonlight works fully without them — all metadata can be edited manually."
+        description="Sources for metadata and artwork. Moonlight fills ROM, Steam and Switch games automatically on scan; the options here add coverage. All metadata can also be edited by hand."
       />
+
+      {/* LaunchBox Games Database — keyless retro metadata */}
+      <div className="mb-4 rounded-xl glass p-5">
+        <div className="flex items-center justify-between gap-4">
+          <div className="min-w-0">
+            <div className="flex items-center gap-2">
+              <span className="text-sm font-medium">LaunchBox Games Database</span>
+              <Badge variant={lbCount && lbCount > 0 ? "success" : "default"}>
+                {lbCount && lbCount > 0 ? `${lbCount.toLocaleString()} games` : "Not downloaded"}
+              </Badge>
+            </div>
+            <p className="mt-1 text-xs text-ink-dim">
+              Keyless retro metadata — descriptions, developer, publisher, genres and release dates for
+              console games (NES, SNES, N64, GameCube, PS1/PS2, Genesis, Dreamcast and more). One-time
+              ~100&nbsp;MB download, cached locally and matched automatically on scan.
+            </p>
+          </div>
+          <Button className="shrink-0" disabled={activeScanId !== null} onClick={downloadLaunchbox}>
+            <Database /> {lbCount && lbCount > 0 ? "Update database" : "Download database"}
+          </Button>
+        </div>
+        <p className="mt-2 text-[10px] text-ink-faint">Metadata courtesy of the LaunchBox Games Database (gamesdb.launchbox-app.com).</p>
+      </div>
 
       <div className="mb-4 rounded-xl glass p-5">
         <div className="flex items-center justify-between gap-4">
           <div className="min-w-0">
-            <div className="text-sm font-medium">Fetch artwork for games missing it</div>
+            <div className="text-sm font-medium">Match metadata & artwork now</div>
             <p className="mt-1 text-xs text-ink-dim">
-              Steam games import their artwork automatically. ROM and manually-added games (GameCube,
-              Switch, PlayStation…) have no local artwork — fetch box art, backgrounds and logos for all
-              of them from a configured provider below.
+              Runs automatically after every scan. Fills release dates, developers, genres and box art
+              for ROM, Steam and Switch games from the keyless sources above — no API key required.
             </p>
           </div>
           <Button
             className="shrink-0"
-            disabled={!anyConfigured || activeScanId !== null}
+            disabled={activeScanId !== null}
             onClick={fetchMissingArtwork}
           >
-            <Image /> Fetch artwork
+            <Image /> Match now
           </Button>
         </div>
-        {!anyConfigured && (
-          <p className="mt-3 text-xs text-ink-faint">
-            Configure a provider API key below to enable this. Without one, you can still add artwork
-            per game from the artwork picker (local file or URL).
-          </p>
-        )}
         {enrichError && (
           <div className="mt-3 rounded-lg border border-danger/30 bg-danger/10 px-3 py-2 text-xs text-danger">
             {enrichError}

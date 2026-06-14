@@ -6,6 +6,7 @@ pub mod domain;
 pub mod enrich;
 pub mod error;
 pub mod launch;
+pub mod launchbox;
 pub mod libretro_art;
 pub mod metadata;
 pub mod paths;
@@ -143,6 +144,8 @@ pub fn run() {
             commands::scanning::cancel_scan,
             commands::scanning::get_last_scan_report,
             commands::meta::get_provider_statuses,
+            commands::meta::launchbox_status,
+            commands::meta::download_launchbox_db,
             commands::meta::search_metadata,
             commands::meta::get_artwork_candidates,
             commands::meta::apply_provider_match,

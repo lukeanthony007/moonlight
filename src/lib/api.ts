@@ -112,6 +112,8 @@ export const getLastScanReport = () => invoke<ScanReport | null>("get_last_scan_
 
 // Metadata & artwork
 export const getProviderStatuses = () => invoke<ProviderStatus[]>("get_provider_statuses");
+export const launchboxStatus = () => invoke<{ count: number }>("launchbox_status");
+export const downloadLaunchboxDb = () => invoke<string>("download_launchbox_db");
 export const searchMetadata = (providerId: string, query: SearchQuery) =>
   invoke<ProviderMatch[]>("search_metadata", { providerId, query });
 export const getArtworkCandidates = (providerId: string, providerGameId: string, kind: ArtworkKind) =>

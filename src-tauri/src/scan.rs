@@ -102,6 +102,45 @@ pub fn title_from_filename(file_name: &str) -> (String, Option<String>) {
     (strip_version_tokens(&raw), region)
 }
 
+/// Extract a release date from a ROM filename's parenthesised tags. Matches a
+/// TOSEC/No-Intro year `(2000)` or a full `(2000-08-06)` date, returning
+/// ISO-8601 (`YYYY-MM-DD`, year-only → `YYYY-01-01`). Implausible years are
+/// ignored so build numbers and IDs are not mistaken for dates.
+pub fn date_from_filename(file_name: &str) -> Option<String> {
+    let mut best: Option<String> = None;
+    let mut tag = String::new();
+    let mut depth = 0u32;
+    for c in file_name.chars() {
+        match c {
+            '(' | '[' => {
+                depth += 1;
+                tag.clear();
+            }
+            ')' | ']' => {
+                depth = depth.saturating_sub(1);
+                let t = tag.trim();
+                // Full date YYYY-MM-DD.
+                if t.len() == 10 && t.as_bytes()[4] == b'-' && t.as_bytes()[7] == b'-' {
+                    if let Ok(d) = chrono::NaiveDate::parse_from_str(t, "%Y-%m-%d") {
+                        return Some(d.format("%Y-%m-%d").to_string());
+                    }
+                }
+                // Bare year.
+                if t.len() == 4 && t.chars().all(|c| c.is_ascii_digit()) {
+                    if let Ok(y) = t.parse::<i32>() {
+                        if (1970..=2030).contains(&y) && best.is_none() {
+                            best = Some(format!("{y}-01-01"));
+                        }
+                    }
+                }
+            }
+            _ if depth > 0 => tag.push(c),
+            _ => {}
+        }
+    }
+    best
+}
+
 /// Like [`title_from_filename`] but keeps version tokens — the form older
 /// scans produced, used to recognize stale auto-generated titles.
 fn title_from_filename_unversioned(file_name: &str) -> (String, Option<String>) {
@@ -520,11 +559,22 @@ pub fn sync_rom_directory(
                 } else {
                     false
                 };
+                // Backfill a release date from the filename when the game has
+                // none yet (older scans never extracted it).
+                let dated = if let Some(date) = date_from_filename(&file.file_name) {
+                    c.execute(
+                        "UPDATE games SET release_date = ?1
+                         WHERE id = ?2 AND release_date IS NULL",
+                        params![date, game_id],
+                    )? > 0
+                } else {
+                    false
+                };
                 let changed = c.execute(
                     "UPDATE installations SET installed = 1, file_size = ?1 WHERE id = ?2 AND installed = 0",
                     params![file.size, install_id],
                 )?;
-                if changed > 0 || healed {
+                if changed > 0 || healed || dated {
                     report.updated += 1;
                 } else {
                     report.skipped += 1;
@@ -545,12 +595,13 @@ pub fn sync_rom_directory(
                 report.skipped += 1;
                 return Ok(());
             }
+            let release_date = date_from_filename(&file.file_name);
             let game = games::insert(
                 c,
                 &games::NewGame {
                     title: &title,
                     platform_id: &dir.platform_id,
-                    release_date: None,
+                    release_date: release_date.as_deref(),
                     region: region.as_deref(),
                 },
             )?;
@@ -1548,6 +1599,22 @@ mod tests {
         // Roman numerals and bare letters are not version tokens.
         let (title, _) = title_from_filename("Grand Theft Auto V.exe");
         assert_eq!(title, "Grand Theft Auto V");
+    }
+
+    #[test]
+    fn release_date_extracted_from_filename_tags() {
+        assert_eq!(
+            date_from_filename("Shenmue v1.003 (2000)(Sega)(NTSC)(US)(Disc 1 of 4)[!].gdi")
+                .as_deref(),
+            Some("2000-01-01")
+        );
+        assert_eq!(
+            date_from_filename("Metroid (USA) (1986-08-06).nes").as_deref(),
+            Some("1986-08-06")
+        );
+        // No year present, and implausible numbers are ignored.
+        assert_eq!(date_from_filename("Super Mario 64 (USA).z64"), None);
+        assert_eq!(date_from_filename("Game (9999).bin"), None);
     }
 
     #[test]

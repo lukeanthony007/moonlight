@@ -436,6 +436,12 @@ function ProvidersSection() {
   const settings = useSettingsStore();
   const providers = useSettingsStore((s) => s.providers);
   const activeScanId = useScanStore((s) => s.activeScanId);
+  const progress = useScanStore((s) => s.progress);
+  // The kind of operation currently running, if any. Each button is disabled
+  // only while *its own* kind runs — a plain library scan never blocks them.
+  const activeSource = activeScanId !== null ? (progress?.source ?? "scan") : null;
+  const downloadBusy = activeSource === "launchbox";
+  const matchBusy = activeSource === "artwork" || activeSource === "launchbox";
   const [key, setKey] = useState("");
   const [enrichError, setEnrichError] = useState<string | null>(null);
   const [lbCount, setLbCount] = useState<number | null>(null);
@@ -495,7 +501,7 @@ function ProvidersSection() {
               ~100&nbsp;MB download, cached locally and matched automatically on scan.
             </p>
           </div>
-          <Button className="shrink-0" disabled={activeScanId !== null} onClick={downloadLaunchbox}>
+          <Button className="shrink-0" disabled={downloadBusy} onClick={downloadLaunchbox}>
             <Database /> {lbCount && lbCount > 0 ? "Update database" : "Download database"}
           </Button>
         </div>
@@ -511,11 +517,7 @@ function ProvidersSection() {
               for ROM, Steam and Switch games from the keyless sources above — no API key required.
             </p>
           </div>
-          <Button
-            className="shrink-0"
-            disabled={activeScanId !== null}
-            onClick={fetchMissingArtwork}
-          >
+          <Button className="shrink-0" disabled={matchBusy} onClick={fetchMissingArtwork}>
             <Image /> Match now
           </Button>
         </div>

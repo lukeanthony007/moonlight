@@ -20,6 +20,11 @@ pub struct LaunchboxStatus {
     pub count: i64,
 }
 
+/// Guards against two concurrent LaunchBox imports (which would race on the
+/// DELETE + bulk re-insert). Managed by Tauri.
+#[derive(Default)]
+pub struct LaunchboxBusy(pub std::sync::atomic::AtomicBool);
+
 #[tauri::command]
 pub async fn launchbox_status(state: State<'_, AppState>) -> Result<LaunchboxStatus> {
     let count = state.db.with(crate::launchbox::cached_count)?;
@@ -34,6 +39,18 @@ pub async fn download_launchbox_db(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<String> {
+    use std::sync::atomic::Ordering;
+    // Refuse a second concurrent import.
+    if app
+        .state::<LaunchboxBusy>()
+        .0
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return Err(crate::error::AppError::Invalid(
+            "a metadata database download is already in progress".into(),
+        ));
+    }
     let scan_id = uuid::Uuid::new_v4().to_string();
     let cancel = app.state::<ScanRegistry>().begin(&scan_id);
 
@@ -79,6 +96,9 @@ pub async fn download_launchbox_db(
         }
         report.duration_ms = started.elapsed().as_millis() as u64;
         app.state::<ScanRegistry>().finish(&scan_id, report.clone());
+        app.state::<LaunchboxBusy>()
+            .0
+            .store(false, Ordering::SeqCst);
         let _ = app.emit("scan-complete", &report);
     });
     Ok(scan_id_out)

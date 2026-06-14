@@ -79,6 +79,7 @@ pub fn run() {
             });
             app.manage(RunningSessions::default());
             app.manage(ScanRegistry::default());
+            app.manage(commands::meta::LaunchboxBusy::default());
 
             // Optional automatic scan on startup.
             let scan_on_startup = db
